@@ -14,6 +14,7 @@ import {
   Tray,
 } from "electron";
 import type { AuthState } from "../shared/contracts";
+import { canGrantMediaPermission, trustedLocalOrigin } from "./media-permission.util";
 import { RecordingStore } from "./recording-store";
 import { DesktopUpdater } from "./updater";
 import { uploadRecording } from "./uploader";
@@ -39,10 +40,6 @@ const optionsSchema = z.object({
   cameraCorner: z.enum(["top-left", "top-right", "bottom-left", "bottom-right"]),
 });
 
-function trustedLocalOrigin(origin: string) {
-  return origin === "null" || origin.startsWith("file://") || origin.startsWith("http://localhost:");
-}
-
 function createMainWindow() {
   const win = new BrowserWindow({
     width: 1180,
@@ -52,7 +49,7 @@ function createMainWindow() {
     backgroundColor: "#10100f",
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     webPreferences: {
-      preload: join(__dirname, "../preload/index.mjs"),
+      preload: join(__dirname, "../preload/index.cjs"),
       partition,
       contextIsolation: true,
       nodeIntegration: false,
@@ -165,7 +162,7 @@ function configureSession() {
   );
   appSession.setPermissionRequestHandler((webContents, permission, callback) => {
     const isMainRenderer = webContents === mainWindow?.webContents;
-    callback(permission === "media" && isMainRenderer && trustedLocalOrigin(new URL(webContents.getURL()).origin));
+    callback(canGrantMediaPermission(permission, isMainRenderer, new URL(webContents.getURL()).origin));
   });
   return appSession;
 }

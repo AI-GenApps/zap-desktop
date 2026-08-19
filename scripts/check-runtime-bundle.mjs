@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-const runtimeBundles = [join("out", "main", "index.js"), join("out", "preload", "index.mjs")];
+const runtimeBundles = [join("out", "main", "index.js"), join("out", "preload", "index.cjs")];
 const forbiddenRuntimeImports = ["@zapture/recorder-core", "/src/index.ts", "\\src\\index.ts"];
 
 for (const bundle of runtimeBundles) {

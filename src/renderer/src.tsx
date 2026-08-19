@@ -11,6 +11,7 @@ import {
   type RecordingOptions,
 } from "@zapture/recorder-core";
 import type { AuthState, CaptureSource, MediaDeviceOption, UploadProgress } from "../shared/contracts";
+import { requestDisplayStream } from "./display-capture.util";
 import "./styles.css";
 
 const CAMERA_SIZES: CameraSize[] = ["off", "small", "medium", "large"];
@@ -189,11 +190,13 @@ function App() {
     setBusy(true);
     setStatus("Opening capture devices…");
     try {
-      const displayConstraints = {
-        audio: includeSystemAudio ? { mandatory: { chromeMediaSource: "desktop", chromeMediaSourceId: selectedSource.id } } : false,
-        video: { mandatory: { chromeMediaSource: "desktop", chromeMediaSourceId: selectedSource.id, maxWidth: 1920, maxHeight: 1080, maxFrameRate: 30 } },
-      } as unknown as MediaStreamConstraints;
-      const displayStream = await navigator.mediaDevices.getUserMedia(displayConstraints);
+      const { stream: displayStream, systemAudioIncluded } = await requestDisplayStream(
+        (requestSystemAudio) => navigator.mediaDevices.getUserMedia({
+          audio: requestSystemAudio ? { mandatory: { chromeMediaSource: "desktop", chromeMediaSourceId: selectedSource.id } } : false,
+          video: { mandatory: { chromeMediaSource: "desktop", chromeMediaSourceId: selectedSource.id, maxWidth: 1920, maxHeight: 1080, maxFrameRate: 30 } },
+        } as unknown as MediaStreamConstraints),
+        includeSystemAudio,
+      );
       const micStream = await navigator.mediaDevices.getUserMedia({
         audio: { deviceId: microphoneDeviceId ? { exact: microphoneDeviceId } : undefined, echoCancellation: true, noiseSuppression: true },
       }).catch(() => null);
@@ -258,7 +261,7 @@ function App() {
         sourceId: selectedSource.id,
         sourceName: selectedSource.name,
         captureMode: selectedSource.kind,
-        includeSystemAudio,
+        includeSystemAudio: systemAudioIncluded,
         microphoneDeviceId: microphoneDeviceId || undefined,
         cameraDeviceId: cameraDeviceId || undefined,
         cameraSize,
@@ -283,7 +286,9 @@ function App() {
       activeRecordingRef.current = manifest;
       setActiveRecording(manifest);
       setElapsedMs(0);
-      setStatus("Recording is live. Your media is being saved locally.");
+      setStatus(systemAudioIncluded || !includeSystemAudio
+        ? "Recording is live. Your media is being saved locally."
+        : "Recording is live without system audio. Your media is being saved locally.");
     } catch (error) {
       cleanupCapture();
       setStatus(error instanceof Error ? error.message : "Could not start recording.");
