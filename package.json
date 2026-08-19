@@ -6,7 +6,8 @@
   "main": "out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
-    "build": "electron-vite build",
+    "build": "electron-vite build && bun run check:runtime-bundle",
+    "check:runtime-bundle": "node scripts/check-runtime-bundle.mjs",
     "lint": "bun run typecheck",
     "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
     "test": "vitest run",
@@ -15,13 +16,13 @@
     "ci:smoke": "electron out/main/index.js --ci-smoke"
   },
   "dependencies": {
-    "@zapture/recorder-core": "workspace:*",
     "electron-updater": "6.8.9",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@zapture/recorder-core": "workspace:*",
     "@types/node": "^24.10.0",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",

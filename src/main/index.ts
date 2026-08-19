@@ -26,6 +26,7 @@ let editorWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let store: RecordingStore;
 let updater: DesktopUpdater;
+let isQuitting = false;
 
 const optionsSchema = z.object({
   sourceId: z.string().min(1),
@@ -51,7 +52,7 @@ function createMainWindow() {
     backgroundColor: "#10100f",
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     webPreferences: {
-      preload: join(__dirname, "../preload/index.js"),
+      preload: join(__dirname, "../preload/index.mjs"),
       partition,
       contextIsolation: true,
       nodeIntegration: false,
@@ -69,8 +70,32 @@ function createMainWindow() {
 
   if (process.env.ELECTRON_RENDERER_URL) void win.loadURL(process.env.ELECTRON_RENDERER_URL);
   else void win.loadFile(join(__dirname, "../renderer/index.html"));
+  win.on("close", (event) => {
+    if (process.platform === "darwin" && !isQuitting) {
+      event.preventDefault();
+      win.hide();
+    }
+  });
+  win.on("closed", () => {
+    if (mainWindow === win) mainWindow = null;
+  });
   mainWindow = win;
   return win;
+}
+
+function showMainWindow() {
+  const win = !mainWindow || mainWindow.isDestroyed() ? createMainWindow() : mainWindow;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  return win;
+}
+
+function prepareRecording() {
+  const win = showMainWindow();
+  const notify = () => win.webContents.send("desktop:prepare-recording");
+  if (win.webContents.isLoading()) win.webContents.once("did-finish-load", notify);
+  else notify();
 }
 
 function createEditorWindow(videoId: string) {
@@ -186,14 +211,16 @@ function configureTray() {
     ? join(process.resourcesPath, "build", "tray-icon.png")
     : join(__dirname, "../../build/tray-icon.png");
   const image = nativeImage.createFromPath(iconPath).resize({ width: 18, height: 18 });
+  if (process.platform === "darwin") image.setTemplateImage(true);
   tray = new Tray(image);
   tray.setToolTip("Zapture");
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: "Open Zapture", click: () => mainWindow?.show() },
+    { label: "Start Recording…", accelerator: "CommandOrControl+Shift+5", click: prepareRecording },
+    { label: "Open Zapture", click: showMainWindow },
     { type: "separator" },
     { label: "Quit", click: () => app.quit() },
   ]));
-  tray.on("click", () => mainWindow?.show());
+  tray.on("click", showMainWindow);
 }
 
 app.whenReady().then(async () => {
@@ -204,7 +231,7 @@ app.whenReady().then(async () => {
   registerIpc();
   const win = createMainWindow();
   configureTray();
-  globalShortcut.register("CommandOrControl+Shift+5", () => win.show());
+  globalShortcut.register("CommandOrControl+Shift+5", prepareRecording);
   updater.start();
 
   if (process.argv.includes("--ci-smoke")) {
@@ -218,7 +245,10 @@ app.whenReady().then(async () => {
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
-app.on("activate", () => (mainWindow ? mainWindow.show() : createMainWindow()));
+app.on("activate", showMainWindow);
+app.on("before-quit", () => {
+  isQuitting = true;
+});
 app.on("will-quit", () => {
   updater?.stop();
   globalShortcut.unregisterAll();

@@ -1,6 +1,8 @@
 import type { BrowserWindow, Session } from "electron";
 import { app } from "electron";
-import { autoUpdater } from "electron-updater";
+import electronUpdater from "electron-updater";
+
+const { autoUpdater } = electronUpdater;
 
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 

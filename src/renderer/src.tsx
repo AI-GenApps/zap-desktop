@@ -84,6 +84,8 @@ function App() {
   const animationRef = useRef<number | null>(null);
   const stoppingRef = useRef(false);
   const writeChainRef = useRef<Promise<void> | null>(null);
+  const transportRef = useRef<HTMLElement | null>(null);
+  const startButtonRef = useRef<HTMLButtonElement | null>(null);
 
   const refreshRecordings = useCallback(async () => setRecordings(await window.zapture.listRecordings()), []);
 
@@ -115,8 +117,16 @@ function App() {
 
   useEffect(() => {
     void Promise.all([refreshSources(), refreshRecordings(), window.zapture.getAuthState().then(setAuth)]);
-    const unsubscribe = window.zapture.onUploadProgress(setUploadProgress);
-    return unsubscribe;
+    const unsubscribeUpload = window.zapture.onUploadProgress(setUploadProgress);
+    const unsubscribePrepare = window.zapture.onPrepareRecording(() => {
+      void refreshSources();
+      transportRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      startButtonRef.current?.focus();
+    });
+    return () => {
+      unsubscribeUpload();
+      unsubscribePrepare();
+    };
   }, [refreshRecordings, refreshSources]);
 
   useEffect(() => {
@@ -355,10 +365,10 @@ function App() {
         </div>
       </section>
 
-      <section className="transport">
+      <section className="transport" ref={transportRef}>
         <p>{status}</p>
         <div>
-          {activeRecording ? <><button onClick={togglePause}>{activeRecording.status === "paused" ? "Resume" : "Pause"}</button><button className="record stop" onClick={() => void stopRecording()} disabled={busy}>Stop & save</button></> : <button className="record" onClick={() => void startRecording()} disabled={busy || !selectedSource}><span />Start recording</button>}
+          {activeRecording ? <><button onClick={togglePause}>{activeRecording.status === "paused" ? "Resume" : "Pause"}</button><button className="record stop" onClick={() => void stopRecording()} disabled={busy}>Stop & save</button></> : <button className="record" ref={startButtonRef} onClick={() => void startRecording()} disabled={busy || !selectedSource}><span />Start recording</button>}
         </div>
       </section>
 

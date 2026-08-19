@@ -16,6 +16,11 @@ const api: DesktopApi = {
   signOut: () => ipcRenderer.invoke("desktop:sign-out"),
   openEditor: (videoId) => ipcRenderer.invoke("desktop:open-editor", videoId),
   checkForUpdates: () => ipcRenderer.invoke("desktop:check-updates"),
+  onPrepareRecording: (listener) => {
+    const handler = () => listener();
+    ipcRenderer.on("desktop:prepare-recording", handler);
+    return () => ipcRenderer.removeListener("desktop:prepare-recording", handler);
+  },
   onUploadProgress: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, progress: UploadProgress) => listener(progress);
     ipcRenderer.on("desktop:upload-progress", handler);

@@ -41,5 +41,6 @@ export interface DesktopApi {
   signOut: () => Promise<void>;
   openEditor: (videoId: string) => Promise<void>;
   checkForUpdates: () => Promise<{ status: string; message: string }>;
+  onPrepareRecording: (listener: () => void) => () => void;
   onUploadProgress: (listener: (progress: UploadProgress) => void) => () => void;
 }
