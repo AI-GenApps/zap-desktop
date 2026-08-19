@@ -12,7 +12,8 @@ const api: DesktopApi = {
   listRecordings: () => ipcRenderer.invoke("desktop:list-recordings"),
   uploadRecording: (id, title, description) => ipcRenderer.invoke("desktop:upload", id, title, description),
   getAuthState: () => ipcRenderer.invoke("desktop:get-auth"),
-  signIn: () => ipcRenderer.invoke("desktop:sign-in"),
+  authenticate: (mode) => ipcRenderer.invoke("desktop:authenticate", mode),
+  continueLocally: () => ipcRenderer.invoke("desktop:continue-locally"),
   signOut: () => ipcRenderer.invoke("desktop:sign-out"),
   openEditor: (videoId) => ipcRenderer.invoke("desktop:open-editor", videoId),
   checkForUpdates: () => ipcRenderer.invoke("desktop:check-updates"),
@@ -20,6 +21,11 @@ const api: DesktopApi = {
     const handler = () => listener();
     ipcRenderer.on("desktop:prepare-recording", handler);
     return () => ipcRenderer.removeListener("desktop:prepare-recording", handler);
+  },
+  onAuthStateChanged: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, state: Parameters<typeof listener>[0]) => listener(state);
+    ipcRenderer.on("desktop:auth-state-changed", handler);
+    return () => ipcRenderer.removeListener("desktop:auth-state-changed", handler);
   },
   onUploadProgress: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, progress: UploadProgress) => listener(progress);

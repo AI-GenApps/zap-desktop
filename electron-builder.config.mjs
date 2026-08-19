@@ -10,6 +10,7 @@ export default {
   extraResources: [{ from: "build/tray-icon.png", to: "build/tray-icon.png" }],
   asar: true,
   artifactName: "Zapture-${version}-${os}-${arch}.${ext}",
+  protocols: [{ name: "Zapture", schemes: ["zapture"] }],
   publish: [{ provider: "generic", url: "https://zapture.app/api/desktop/updates" }],
   mac: {
     category: "public.app-category.productivity",

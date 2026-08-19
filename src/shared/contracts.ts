@@ -18,6 +18,8 @@ export interface AuthState {
   user?: { id: string; email: string; name?: string; avatar?: string };
 }
 
+export type AuthMode = "sign-in" | "sign-up";
+
 export interface UploadProgress {
   phase: "preparing" | "uploading" | "finalizing" | "complete";
   uploadedBytes: number;
@@ -37,10 +39,12 @@ export interface DesktopApi {
   listRecordings: () => Promise<RecordingManifest[]>;
   uploadRecording: (id: string, title: string, description: string) => Promise<RecordingManifest>;
   getAuthState: () => Promise<AuthState>;
-  signIn: () => Promise<AuthState>;
+  authenticate: (mode: AuthMode) => Promise<AuthState>;
+  continueLocally: () => Promise<void>;
   signOut: () => Promise<void>;
   openEditor: (videoId: string) => Promise<void>;
   checkForUpdates: () => Promise<{ status: string; message: string }>;
   onPrepareRecording: (listener: () => void) => () => void;
+  onAuthStateChanged: (listener: (state: AuthState) => void) => () => void;
   onUploadProgress: (listener: (progress: UploadProgress) => void) => () => void;
 }

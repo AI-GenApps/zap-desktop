@@ -10,8 +10,9 @@ import {
   type RecordingManifest,
   type RecordingOptions,
 } from "@zapture/recorder-core";
-import type { AuthState, CaptureSource, MediaDeviceOption, UploadProgress } from "../shared/contracts";
+import type { AuthMode, AuthState, CaptureSource, MediaDeviceOption, UploadProgress } from "../shared/contracts";
 import { requestDisplayStream } from "./display-capture.util";
+import { Onboarding } from "./onboarding";
 import "./styles.css";
 
 const CAMERA_SIZES: CameraSize[] = ["off", "small", "medium", "large"];
@@ -62,6 +63,7 @@ function RecordingRow({ recording, onUpload, onEdit, onDelete }: {
 }
 
 function App() {
+  const [view, setView] = useState<"loading" | "onboarding" | "recorder">("loading");
   const [sources, setSources] = useState<CaptureSource[]>([]);
   const [selectedSource, setSelectedSource] = useState<CaptureSource>();
   const [microphones, setMicrophones] = useState<MediaDeviceOption[]>([]);
@@ -78,6 +80,7 @@ function App() {
   const [status, setStatus] = useState("Choose a screen or window to begin.");
   const [busy, setBusy] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress>();
+  const [authError, setAuthError] = useState<string>();
   const recorderRef = useRef<MediaRecorder | null>(null);
   const activeRecordingRef = useRef<RecordingManifest | null>(null);
   const streamsRef = useRef<MediaStream[]>([]);
@@ -117,18 +120,38 @@ function App() {
   }, []);
 
   useEffect(() => {
-    void Promise.all([refreshSources(), refreshRecordings(), window.zapture.getAuthState().then(setAuth)]);
+    let disposed = false;
+    void window.zapture.getAuthState().then((state) => {
+      if (disposed) return;
+      setAuth(state);
+      setView(state.authenticated ? "recorder" : "onboarding");
+    });
     const unsubscribeUpload = window.zapture.onUploadProgress(setUploadProgress);
+    const unsubscribeAuth = window.zapture.onAuthStateChanged((state) => {
+      setAuth(state);
+      if (state.authenticated) {
+        setAuthError(undefined);
+        setView("recorder");
+      }
+    });
     const unsubscribePrepare = window.zapture.onPrepareRecording(() => {
+      setView("recorder");
       void refreshSources();
       transportRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
       startButtonRef.current?.focus();
     });
     return () => {
+      disposed = true;
       unsubscribeUpload();
+      unsubscribeAuth();
       unsubscribePrepare();
     };
-  }, [refreshRecordings, refreshSources]);
+  }, [refreshSources]);
+
+  useEffect(() => {
+    if (view !== "recorder") return;
+    void Promise.all([refreshSources(), refreshRecordings()]);
+  }, [refreshRecordings, refreshSources, view]);
 
   useEffect(() => {
     if (!activeRecording || !["recording", "paused"].includes(activeRecording.status)) return;
@@ -308,11 +331,35 @@ function App() {
     setActiveRecording(updated);
   };
 
+  const runAuthentication = async (mode: AuthMode) => {
+    setBusy(true);
+    setAuthError(undefined);
+    try {
+      const next = await window.zapture.authenticate(mode);
+      setAuth(next);
+      if (next.authenticated) setView("recorder");
+      else setAuthError("Zapture could not verify your account. Please try again.");
+      return next;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Zapture could not complete sign-in.";
+      setAuthError(message);
+      if (view === "recorder") setStatus(message);
+      return undefined;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const continueLocally = async () => {
+    await window.zapture.continueLocally();
+    setAuthError(undefined);
+    setView("recorder");
+  };
+
   const runUpload = async (recording: RecordingManifest) => {
     if (!auth.authenticated) {
-      const next = await window.zapture.signIn();
-      setAuth(next);
-      if (!next.authenticated) return;
+      const next = await runAuthentication("sign-in");
+      if (!next?.authenticated) return;
     }
     const title = `Zapture ${new Date(recording.startedAt).toLocaleString()}`;
     try {
@@ -328,13 +375,23 @@ function App() {
     }
   };
 
+  if (view === "loading") return <main className="onboarding-shell onboarding-loading"><div className="onboarding-mark" aria-hidden="true"><span>Z</span></div></main>;
+  if (view === "onboarding") return (
+    <Onboarding
+      busy={busy}
+      error={authError}
+      onAuthenticate={(mode) => void runAuthentication(mode)}
+      onContinueLocally={() => void continueLocally()}
+    />
+  );
+
   return (
     <main className="app-shell">
       <header className="masthead">
         <div className="brand"><span className="brand-mark">Z</span><span>Zapture</span></div>
         <div className="live-status"><i className={activeRecording?.status === "recording" ? "live" : ""} />{activeRecording ? activeRecording.status : "standby"}</div>
         <div className="auth-slot">
-          {auth.authenticated ? <><span>{auth.user?.name || auth.user?.email}</span><button className="quiet" onClick={async () => { await window.zapture.signOut(); setAuth({ authenticated: false, canUpload: false }); }}>Sign out</button></> : <button onClick={async () => setAuth(await window.zapture.signIn())}>Sign in</button>}
+          {auth.authenticated ? <><span>{auth.user?.name || auth.user?.email}</span><button className="quiet" disabled={Boolean(activeRecording)} onClick={async () => { await window.zapture.signOut(); setAuth({ authenticated: false, canUpload: false }); setView("onboarding"); }}>Sign out</button></> : <button onClick={() => void runAuthentication("sign-in")}>Sign in</button>}
         </div>
       </header>
 
