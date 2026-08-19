@@ -1,0 +1,36 @@
+{
+  "name": "zapture-desktop",
+  "version": "0.0.0-development",
+  "private": true,
+  "type": "module",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "lint": "bun run typecheck",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "test": "vitest run",
+    "package:mac": "bun run build && electron-builder --config electron-builder.config.mjs --mac --universal",
+    "package:win": "bun run build && electron-builder --config electron-builder.config.mjs --win --x64",
+    "ci:smoke": "electron out/main/index.js --ci-smoke"
+  },
+  "dependencies": {
+    "@zapture/recorder-core": "workspace:*",
+    "electron-updater": "6.8.9",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^4.7.0",
+    "electron": "43.4.1",
+    "electron-builder": "26.15.3",
+    "electron-vite": "5.0.0",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.1",
+    "vitest": "4.1.11"
+  }
+}
