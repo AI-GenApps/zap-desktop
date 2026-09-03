@@ -132,6 +132,9 @@ function App() {
       if (state.authenticated) {
         setAuthError(undefined);
         setView("recorder");
+      } else {
+        setAuthError(state.error);
+        setView("onboarding");
       }
     });
     const unsubscribePrepare = window.zapture.onPrepareRecording(() => {
@@ -338,12 +341,16 @@ function App() {
       const next = await window.zapture.authenticate(mode);
       setAuth(next);
       if (next.authenticated) setView("recorder");
-      else setAuthError("Zapture could not verify your account. Please try again.");
+      else {
+        setAuthError(next.error || "Zapture could not verify your account. Please try again.");
+        setView("onboarding");
+      }
       return next;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Zapture could not complete sign-in.";
+      setAuth({ authenticated: false, canUpload: false, error: message });
       setAuthError(message);
-      if (view === "recorder") setStatus(message);
+      setView("onboarding");
       return undefined;
     } finally {
       setBusy(false);

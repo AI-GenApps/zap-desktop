@@ -15,6 +15,7 @@ export interface MediaDeviceOption {
 export interface AuthState {
   authenticated: boolean;
   canUpload: boolean;
+  error?: string;
   user?: { id: string; email: string; name?: string; avatar?: string };
 }
 

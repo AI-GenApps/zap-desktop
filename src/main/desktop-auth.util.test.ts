@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   AUTH_ATTEMPT_TTL_MS,
+  buildDesktopAuthRedirectUrl,
   buildHostedAuthUrl,
+  extractDesktopAuthAttemptId,
   extractDesktopAuthUrl,
   parseDesktopAuthCallback,
   parseStoredAuthAttempt,
+  unauthenticatedAuthState,
   type PendingAuthAttempt,
 } from "./desktop-auth.util";
 
@@ -16,6 +19,15 @@ const attempt: PendingAuthAttempt = {
 };
 
 describe("desktop authentication utilities", () => {
+  it("preserves a visible failure on the onboarding auth state", () => {
+    expect(unauthenticatedAuthState("This authentication callback does not match the active sign-in attempt.")).toEqual({
+      authenticated: false,
+      canUpload: false,
+      error: "This authentication callback does not match the active sign-in attempt.",
+    });
+    expect(unauthenticatedAuthState()).toEqual({ authenticated: false, canUpload: false });
+  });
+
   it("builds distinct hosted login and signup URLs with a first-party callback", () => {
     const login = new URL(buildHostedAuthUrl("sign-in", attempt.id));
     const signup = new URL(buildHostedAuthUrl("sign-up", attempt.id));
@@ -26,6 +38,7 @@ describe("desktop authentication utilities", () => {
     const returnUrl = new URL(login.searchParams.get("returnUrl")!);
     expect(returnUrl.origin + returnUrl.pathname).toBe("https://zapture.app/desktop/auth/callback");
     expect(returnUrl.searchParams.get("attempt_id")).toBe(attempt.id);
+    expect(buildDesktopAuthRedirectUrl(attempt.id)).toBe(returnUrl.toString());
   });
 
   it("accepts a matching one-time callback", () => {
@@ -65,6 +78,9 @@ describe("desktop authentication utilities", () => {
   it("validates persisted attempts and extracts protocol arguments", () => {
     expect(parseStoredAuthAttempt(attempt, now)).toEqual(attempt);
     expect(parseStoredAuthAttempt({ ...attempt, mode: "other" }, now)).toBeNull();
+    expect(extractDesktopAuthAttemptId(`zapture://auth/callback?attempt_id=${attempt.id}`)).toBe(attempt.id);
+    expect(extractDesktopAuthAttemptId("zapture://auth/callback?attempt_id=wrong")).toBe("wrong");
+    expect(extractDesktopAuthAttemptId(`https://zapture.app/callback?attempt_id=${attempt.id}`)).toBeNull();
     expect(extractDesktopAuthUrl(["Zapture.exe", "--flag", "zapture://auth/callback?auth_code=1"])).toBe(
       "zapture://auth/callback?auth_code=1",
     );

@@ -18,10 +18,13 @@ import {
 import type { AuthMode, AuthState } from "../shared/contracts";
 import {
   AUTH_ATTEMPT_TTL_MS,
+  buildDesktopAuthRedirectUrl,
   buildHostedAuthUrl,
+  extractDesktopAuthAttemptId,
   extractDesktopAuthUrl,
   parseDesktopAuthCallback,
   parseStoredAuthAttempt,
+  unauthenticatedAuthState,
   type PendingAuthAttempt,
 } from "./desktop-auth.util";
 import { canGrantMediaPermission, trustedLocalOrigin } from "./media-permission.util";
@@ -40,6 +43,7 @@ let updater: DesktopUpdater;
 let isQuitting = false;
 let windowMode: "onboarding" | "recorder" = "onboarding";
 let queuedAuthUrl = extractDesktopAuthUrl(process.argv);
+let pendingAuthFileOperation: Promise<void> = Promise.resolve();
 let pendingAuthRequest: {
   attemptId: string;
   resolve: (state: AuthState) => void;
@@ -168,29 +172,53 @@ function pendingAuthPath() {
   return join(app.getPath("userData"), "pending-auth.json");
 }
 
-async function savePendingAuthAttempt(attempt: PendingAuthAttempt) {
-  const path = pendingAuthPath();
-  const temporaryPath = `${path}.tmp`;
-  await writeFile(temporaryPath, JSON.stringify(attempt), { encoding: "utf8", mode: 0o600 });
-  await rename(temporaryPath, path);
+function withPendingAuthFileLock<T>(operation: () => Promise<T>): Promise<T> {
+  const result = pendingAuthFileOperation.then(operation, () => operation());
+  pendingAuthFileOperation = result.then(() => undefined, () => undefined);
+  return result;
 }
 
-async function clearPendingAuthAttempt() {
+async function savePendingAuthAttempt(attempt: PendingAuthAttempt) {
+  return withPendingAuthFileLock(async () => {
+    const path = pendingAuthPath();
+    const temporaryPath = `${path}.tmp`;
+    await writeFile(temporaryPath, JSON.stringify(attempt), { encoding: "utf8", mode: 0o600 });
+    await rename(temporaryPath, path);
+  });
+}
+
+async function clearPendingAuthAttemptFile(expectedAttemptId?: string) {
+  if (expectedAttemptId) {
+    try {
+      const value = JSON.parse(await readFile(pendingAuthPath(), "utf8")) as unknown;
+      const currentAttempt = parseStoredAuthAttempt(value);
+      if (currentAttempt && currentAttempt.id !== expectedAttemptId) return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    }
+  }
+
   await unlink(pendingAuthPath()).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== "ENOENT") throw error;
   });
 }
 
+async function clearPendingAuthAttempt(expectedAttemptId?: string) {
+  return withPendingAuthFileLock(() => clearPendingAuthAttemptFile(expectedAttemptId));
+}
+
 async function loadPendingAuthAttempt() {
-  try {
-    const value = JSON.parse(await readFile(pendingAuthPath(), "utf8")) as unknown;
-    const attempt = parseStoredAuthAttempt(value);
-    if (!attempt) await clearPendingAuthAttempt();
-    return attempt;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") await clearPendingAuthAttempt();
-    return null;
-  }
+  return withPendingAuthFileLock(async () => {
+    try {
+      const value = JSON.parse(await readFile(pendingAuthPath(), "utf8")) as unknown;
+      const attempt = parseStoredAuthAttempt(value);
+      if (!attempt) await clearPendingAuthAttemptFile();
+      return attempt;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") await clearPendingAuthAttemptFile();
+      return null;
+    }
+  });
 }
 
 function settlePendingAuth(attemptId: string, state?: AuthState, error?: Error) {
@@ -214,7 +242,7 @@ async function authenticate(mode: AuthMode) {
   const result = new Promise<AuthState>((resolveRequest, rejectRequest) => {
     const timeout = setTimeout(() => {
       settlePendingAuth(attempt.id, undefined, new Error("Sign-in timed out. Please try again."));
-      void clearPendingAuthAttempt();
+      void clearPendingAuthAttempt(attempt.id);
     }, AUTH_ATTEMPT_TTL_MS);
     pendingAuthRequest = { attemptId: attempt.id, resolve: resolveRequest, reject: rejectRequest, timeout };
   });
@@ -222,7 +250,7 @@ async function authenticate(mode: AuthMode) {
   try {
     await shell.openExternal(buildHostedAuthUrl(mode, attempt.id));
   } catch (error) {
-    await clearPendingAuthAttempt();
+    await clearPendingAuthAttempt(attempt.id);
     settlePendingAuth(attempt.id, undefined, error instanceof Error ? error : new Error("Could not open the browser."));
   }
   return result;
@@ -235,20 +263,47 @@ function sendAuthState(state: AuthState) {
   else notify();
 }
 
+function showAuthFailure(message: string) {
+  applyWindowMode("onboarding");
+  const win = showMainWindow();
+  sendAuthState(unauthenticatedAuthState(message));
+  win.focus();
+}
+
 async function handleDesktopAuthCallback(rawUrl: string) {
   const attempt = await loadPendingAuthAttempt();
+  // Ignore stale or unsolicited protocol URLs. A browser or another process
+  // can deliver these after an attempt has completed; they must not interrupt
+  // an active recorder or cancel a newer sign-in attempt.
   if (!attempt) return;
+  if (extractDesktopAuthAttemptId(rawUrl) !== attempt.id) return;
 
-  let matchedAttempt = false;
+  let callback: ReturnType<typeof parseDesktopAuthCallback>;
   try {
-    const callback = parseDesktopAuthCallback(rawUrl, attempt);
-    matchedAttempt = true;
-    if (callback.type === "error") throw new Error(`Authentication failed: ${callback.message}`);
+    callback = parseDesktopAuthCallback(rawUrl, attempt);
+  } catch {
+    // An attempt-id match is not enough: malformed callbacks must not consume
+    // the pending attempt or change the renderer state.
+    return;
+  }
 
+  if (callback.type === "error") {
+    await clearPendingAuthAttempt(attempt.id);
+    const authError = new Error(`Authentication failed: ${callback.message}`);
+    settlePendingAuth(attempt.id, undefined, authError);
+    showAuthFailure(authError.message);
+    return;
+  }
+
+  try {
     const response = await session.fromPartition(partition).fetch(`${API_BASE_URL}/api/auth/exchange`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: callback.code }),
+      body: JSON.stringify({
+        code: callback.code,
+        client_id: "zapture",
+        redirect_uri: buildDesktopAuthRedirectUrl(attempt.id),
+      }),
       credentials: "include",
     });
     const data = (await response.json().catch(() => ({}))) as AuthState & { error?: string; message?: string };
@@ -257,19 +312,17 @@ async function handleDesktopAuthCallback(rawUrl: string) {
     }
 
     await session.fromPartition(partition).cookies.flushStore();
-    await clearPendingAuthAttempt();
+    await clearPendingAuthAttempt(attempt.id);
     applyWindowMode("recorder");
     const win = showMainWindow();
     sendAuthState(data);
     settlePendingAuth(attempt.id, data);
     win.focus();
   } catch (error) {
-    if (!matchedAttempt) return;
-    await clearPendingAuthAttempt();
+    await clearPendingAuthAttempt(attempt.id);
     const authError = error instanceof Error ? error : new Error("Zapture could not complete sign-in.");
     settlePendingAuth(attempt.id, undefined, authError);
-    applyWindowMode("onboarding");
-    showMainWindow();
+    showAuthFailure(authError.message);
   }
 }
 
