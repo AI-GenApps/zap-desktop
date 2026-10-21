@@ -1,7 +1,7 @@
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { RecordingManifest, RecordingOptions, RecordingStatus } from "@zapture/recorder-core";
-import { extensionFromMimeType, recordingDuration } from "@zapture/recorder-core";
+import { extensionFromMimeType, pauseTimingFor, recordingDuration } from "@zapture/recorder-core";
 
 const RECORDING_ID = /^[0-9a-f-]{36}$/i;
 
@@ -66,12 +66,14 @@ export class RecordingStore {
       ...current,
       chunkCount: current.chunkCount + 1,
       totalSize: current.totalSize + data.byteLength,
-      durationMs: recordingDuration(current.startedAt),
+      durationMs: recordingDuration(current),
     });
   }
 
-  async setStatus(id: string, status: RecordingStatus) {
-    return this.patch(id, { status });
+  async setStatus(id: string, status: Extract<RecordingStatus, "paused" | "recording">) {
+    const current = await this.get(id);
+    const timing = pauseTimingFor(current, status);
+    return this.writeManifest({ ...current, ...timing, status, durationMs: recordingDuration({ ...current, ...timing }) });
   }
 
   async finalize(id: string) {
@@ -86,10 +88,12 @@ export class RecordingStore {
     }
 
     const stoppedAt = Date.now();
+    const timing = pauseTimingFor(manifest, "recording", stoppedAt);
     manifest = await this.patch(id, {
+      ...timing,
       status: "ready",
       stoppedAt,
-      durationMs: recordingDuration(manifest.startedAt, stoppedAt),
+      durationMs: recordingDuration({ ...manifest, ...timing }, stoppedAt),
       finalFile,
       totalSize: (await stat(finalFile)).size,
       error: undefined,

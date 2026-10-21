@@ -34,6 +34,10 @@ export interface RecordingManifest {
   extension: "webm" | "mp4";
   startedAt: number;
   stoppedAt?: number;
+  /** Set while paused; the pause is folded into `pausedMs` on resume or stop. */
+  pausedAt?: number;
+  /** Total completed pause time, excluded from `durationMs`. */
+  pausedMs?: number;
   durationMs: number;
   chunkCount: number;
   totalSize: number;
@@ -96,6 +100,22 @@ export function pickRecorderMimeType(isSupported: (mimeType: string) => boolean)
   ].find(isSupported) ?? null;
 }
 
-export function recordingDuration(startedAt: number, stoppedAt = Date.now()) {
-  return Math.max(0, stoppedAt - startedAt);
+/** Active recording time: wall time since start, minus completed and in-progress pauses. */
+export function recordingDuration(
+  timing: Pick<RecordingManifest, "startedAt" | "pausedAt" | "pausedMs">,
+  now = Date.now(),
+) {
+  const currentPause = timing.pausedAt ? Math.max(0, now - timing.pausedAt) : 0;
+  return Math.max(0, now - timing.startedAt - (timing.pausedMs ?? 0) - currentPause);
+}
+
+/** Pause bookkeeping for a status change; a repeated status is a no-op. */
+export function pauseTimingFor(
+  timing: Pick<RecordingManifest, "pausedAt" | "pausedMs">,
+  status: "paused" | "recording",
+  now = Date.now(),
+): Pick<RecordingManifest, "pausedAt" | "pausedMs"> {
+  if (status === "paused") return { pausedAt: timing.pausedAt ?? now, pausedMs: timing.pausedMs ?? 0 };
+  const completed = timing.pausedAt ? Math.max(0, now - timing.pausedAt) : 0;
+  return { pausedAt: undefined, pausedMs: (timing.pausedMs ?? 0) + completed };
 }
