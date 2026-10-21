@@ -6,6 +6,7 @@ import {
   app,
   BrowserWindow,
   desktopCapturer,
+  dialog,
   globalShortcut,
   ipcMain,
   Menu,
@@ -28,6 +29,7 @@ import {
   type PendingAuthAttempt,
 } from "./desktop-auth.util";
 import { canGrantMediaPermission, trustedLocalOrigin } from "./media-permission.util";
+import { isTrustedNavigation } from "./navigation.util";
 import { RecordingStore } from "./recording-store";
 import { DesktopUpdater } from "./updater";
 import { uploadRecording } from "./uploader";
@@ -99,11 +101,12 @@ function createMainWindow() {
     },
   });
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith(API_BASE_URL)) void shell.openExternal(url);
+    if (isTrustedNavigation(url, { origins: [API_BASE_URL] })) void shell.openExternal(url);
     return { action: "deny" };
   });
+  const rendererOrigin = process.env.ELECTRON_RENDERER_URL ? new URL(process.env.ELECTRON_RENDERER_URL).origin : undefined;
   win.webContents.on("will-navigate", (event, url) => {
-    if (!url.startsWith("file://") && !url.startsWith("http://localhost:")) event.preventDefault();
+    if (!isTrustedNavigation(url, { origins: rendererOrigin ? [rendererOrigin] : [], allowFile: true })) event.preventDefault();
   });
 
   if (process.env.ELECTRON_RENDERER_URL) void win.loadURL(process.env.ELECTRON_RENDERER_URL);
@@ -138,7 +141,16 @@ function prepareRecording() {
 }
 
 function createEditorWindow(videoId: string) {
-  editorWindow?.close();
+  const url = `${API_BASE_URL}/editor/${encodeURIComponent(videoId)}`;
+  if (editorWindow && !editorWindow.isDestroyed()) {
+    if (editorWindow.isMinimized()) editorWindow.restore();
+    editorWindow.focus();
+    // Switching videos can be cancelled from the unsaved-changes prompt below.
+    if (editorWindow.webContents.getURL() !== url) void editorWindow.loadURL(url).catch(() => undefined);
+    return;
+  }
+
+  const hostedOrigins = [API_BASE_URL, AUTH_ORIGIN];
   const win = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -147,14 +159,31 @@ function createEditorWindow(videoId: string) {
     backgroundColor: "#090909",
     webPreferences: { partition, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true },
   });
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith(API_BASE_URL) || url.startsWith(AUTH_ORIGIN)) void shell.openExternal(url);
+  win.webContents.setWindowOpenHandler(({ url: target }) => {
+    if (isTrustedNavigation(target, { origins: hostedOrigins })) void shell.openExternal(target);
     return { action: "deny" };
   });
-  win.webContents.on("will-navigate", (event, url) => {
-    if (!url.startsWith(API_BASE_URL) && !url.startsWith(AUTH_ORIGIN)) event.preventDefault();
+  win.webContents.on("will-navigate", (event, target) => {
+    if (!isTrustedNavigation(target, { origins: hostedOrigins })) event.preventDefault();
   });
-  void win.loadURL(`${API_BASE_URL}/editor/${encodeURIComponent(videoId)}`);
+  // Electron silently cancels any close or navigation that a `beforeunload`
+  // handler vetoes, so the editor's unsaved-changes guard would otherwise leave
+  // the window impossible to close.
+  win.webContents.on("will-prevent-unload", (event) => {
+    const choice = dialog.showMessageBoxSync(win, {
+      type: "question",
+      buttons: ["Leave", "Stay"],
+      defaultId: 1,
+      cancelId: 1,
+      title: "Unsaved changes",
+      message: "You have unsaved changes. Leave without saving?",
+    });
+    if (choice === 0) event.preventDefault();
+  });
+  win.on("closed", () => {
+    if (editorWindow === win) editorWindow = null;
+  });
+  void win.loadURL(url);
   editorWindow = win;
 }
 
