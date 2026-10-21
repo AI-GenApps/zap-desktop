@@ -1,5 +1,11 @@
 import type { RecordingManifest, RecordingOptions } from "@zapture/recorder-core";
 
+export interface CameraTrackStart {
+  mimeType: string;
+  startOffsetMs: number;
+  aspect: number;
+}
+
 export interface CaptureSource {
   id: string;
   name: string;
@@ -22,7 +28,7 @@ export interface AuthState {
 export type AuthMode = "sign-in" | "sign-up";
 
 export interface UploadProgress {
-  phase: "preparing" | "uploading" | "finalizing" | "complete";
+  phase: "preparing" | "uploading" | "finalizing" | "complete" | "camera";
   uploadedBytes: number;
   totalBytes: number;
   message: string;
@@ -47,8 +53,11 @@ export type MenuCommand = "stop-recording" | "show-library";
 export interface DesktopApi {
   platform: string;
   getSources: () => Promise<CaptureSource[]>;
-  beginRecording: (options: RecordingOptions, mimeType: string) => Promise<RecordingManifest>;
+  beginRecording: (options: RecordingOptions, mimeType: string, camera?: CameraTrackStart) => Promise<RecordingManifest>;
   appendChunk: (id: string, chunk: ArrayBuffer) => Promise<RecordingManifest>;
+  appendCameraChunk: (id: string, chunk: ArrayBuffer) => Promise<RecordingManifest>;
+  /** Reports a camera-only failure or the measured frame aspect; the screen recording is unaffected. */
+  reportCameraTrack: (id: string, report: { error?: string; aspect?: number; startOffsetMs?: number }) => Promise<void>;
   setRecordingStatus: (id: string, status: "paused" | "recording") => Promise<RecordingManifest>;
   finalizeRecording: (id: string) => Promise<RecordingManifest>;
   deleteRecording: (id: string) => Promise<void>;

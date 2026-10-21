@@ -4,9 +4,13 @@ import {
   MAX_RECORDING_DURATION_MS,
   MAX_UPLOAD_SIZE_BYTES,
   RECORDING_TIMESLICE_MS,
+  clampCameraOffsetMs,
+  pickCameraRecorderMimeType,
   pickRecorderMimeType,
   recordingDuration,
   type CameraCorner,
+  type CameraMode,
+  type CameraShape,
   type CameraSize,
   type RecordingManifest,
   type RecordingOptions,
@@ -24,14 +28,35 @@ const CAMERA_SIZES: { value: CameraSize; label: string }[] = [
   { value: "medium", label: "M" },
   { value: "large", label: "L" },
 ];
+const CAMERA_SHAPES: { value: CameraShape; label: string }[] = [
+  { value: "circle", label: "Circle" },
+  { value: "rounded", label: "Rounded" },
+];
 const CORNERS: CameraCorner[] = ["top-left", "top-right", "bottom-left", "bottom-right"];
 const COUNTDOWN_SECONDS = 3;
 const COMPOSITOR_FPS = 30;
+
+interface PreparedCamera {
+  /** Video-only clone of the open camera stream, fed to its own recorder. */
+  stream: MediaStream;
+  mimeType: string;
+}
 
 interface PreparedCapture {
   output: MediaStream;
   mimeType: string;
   options: RecordingOptions;
+  camera?: PreparedCamera;
+  /** Shown once recording starts, e.g. when the camera had to be skipped. */
+  note?: string;
+}
+
+const CAMERA_ASPECT_FALLBACK = 16 / 9;
+const CAMERA_VIDEO_BITRATE = 2_000_000;
+
+function cameraAspectOf(stream: MediaStream | null) {
+  const settings = stream?.getVideoTracks()[0]?.getSettings();
+  return settings?.width && settings.height ? settings.width / settings.height : CAMERA_ASPECT_FALLBACK;
 }
 
 function SourceCard({ source, selected, onSelect }: { source: CaptureSource; selected: boolean; onSelect: () => void }) {
@@ -53,6 +78,7 @@ function RecordingRow({ recording, uploadProgress, busy, onUpload, onEdit, onDel
 }) {
   const started = new Date(recording.startedAt);
   const uploading = recording.status === "uploading" && uploadProgress;
+  const cameraPending = recording.status === "uploaded" && Boolean(recording.videoId && recording.camera?.finalFile && !recording.camera.uploaded);
   return (
     <li className="recording-row">
       <span className="recording-icon" aria-hidden="true"><FilmIcon /></span>
@@ -68,11 +94,13 @@ function RecordingRow({ recording, uploadProgress, busy, onUpload, onEdit, onDel
           </span>
         ) : null}
         {recording.status === "failed" && recording.error ? <span className="row-error">{recording.error}</span> : null}
+        {cameraPending ? <span className="row-error">Ready to upload camera{recording.camera?.error ? `: ${recording.camera.error}` : ""}</span> : null}
       </div>
       <span className={`badge badge-${recording.status}`}>{recording.status}</span>
       <div className="row-actions">
         {recording.status === "uploaded" && recording.videoId ? <button className="btn" onClick={onEdit}>Edit</button> : null}
         {["ready", "failed"].includes(recording.status) ? <button className="btn btn-primary" onClick={onUpload} disabled={busy}>Upload</button> : null}
+        {cameraPending ? <button className="btn" onClick={onUpload} disabled={busy} title={recording.camera?.error}>Upload camera</button> : null}
         <button className="btn btn-plain" onClick={onDelete} disabled={recording.status === "uploading"} aria-label="Delete recording" title="Delete"><TrashIcon /></button>
       </div>
     </li>
@@ -92,6 +120,8 @@ function App() {
   const [cameraDeviceId, setCameraDeviceId] = useState("");
   const [cameraSize, setCameraSize] = useState<CameraSize>("medium");
   const [cameraCorner, setCameraCorner] = useState<CameraCorner>("bottom-left");
+  const [cameraShape, setCameraShape] = useState<CameraShape>("circle");
+  const [burnCamera, setBurnCamera] = useState(false);
   const [includeSystemAudio, setIncludeSystemAudio] = useState(true);
   const [recordings, setRecordings] = useState<RecordingManifest[]>([]);
   const [activeRecording, setActiveRecording] = useState<RecordingManifest>();
@@ -110,6 +140,9 @@ function App() {
   const compositorRef = useRef<number | null>(null);
   const stoppingRef = useRef(false);
   const writeChainRef = useRef<Promise<void> | null>(null);
+  const cameraRecorderRef = useRef<MediaRecorder | null>(null);
+  const cameraSourceRef = useRef<MediaStream | null>(null);
+  const cameraWriteChainRef = useRef<Promise<void> | null>(null);
   const cancelCountdownRef = useRef<(() => void) | null>(null);
   const startButtonRef = useRef<HTMLButtonElement | null>(null);
   const commandsRef = useRef<Record<RecordingCommand | "stop-recording", () => void>>(null!);
@@ -223,6 +256,8 @@ function App() {
       track.stop();
     }));
     streamsRef.current = [];
+    cameraRecorderRef.current = null;
+    cameraSourceRef.current = null;
     if (compositorRef.current !== null) window.clearInterval(compositorRef.current);
     compositorRef.current = null;
     void audioContextRef.current?.close();
@@ -238,14 +273,26 @@ function App() {
     setBusy(true);
     setStatus("Saving recording…");
     try {
-      const stopped = new Promise<void>((resolve) => recorder.addEventListener("stop", () => resolve(), { once: true }));
-      recorder.stop();
-      await stopped;
+      const cameraRecorder = cameraRecorderRef.current;
+      const stopRecorder = (target: MediaRecorder) => new Promise<void>((resolve) => {
+        if (target.state === "inactive") return resolve();
+        target.addEventListener("stop", () => resolve(), { once: true });
+        target.stop();
+      });
+      // Both recorders stop together; each flushes a final dataavailable before its stop event.
+      const aspect = cameraAspectOf(cameraSourceRef.current);
+      await Promise.all([stopRecorder(recorder), cameraRecorder ? stopRecorder(cameraRecorder) : Promise.resolve()]);
       recorder.ondataavailable = null;
+      if (cameraRecorder) cameraRecorder.ondataavailable = null;
       await (writeChainRef.current ?? Promise.resolve());
+      await (cameraWriteChainRef.current ?? Promise.resolve());
+      if (cameraRecorder) await window.zapture.reportCameraTrack(recording.id, { aspect }).catch(() => undefined);
       cleanupCapture();
       const finalized = await window.zapture.finalizeRecording(recording.id);
       recorderRef.current = null;
+      cameraRecorderRef.current = null;
+      cameraSourceRef.current = null;
+      cameraWriteChainRef.current = null;
       activeRecordingRef.current = null;
       setActiveRecording(undefined);
       setElapsedMs(0);
@@ -276,17 +323,40 @@ function App() {
     const micStream = await navigator.mediaDevices.getUserMedia({
       audio: { deviceId: microphoneDeviceId ? { exact: microphoneDeviceId } : undefined, echoCancellation: true, noiseSuppression: true },
     }).catch(() => null);
+    const separateCamera = cameraSize !== "off" && !burnCamera;
+    // Opened once and kept open for the whole recording; the separate recorder works on a clone.
     const cameraStream = cameraSize === "off" ? null : await navigator.mediaDevices.getUserMedia({
-      video: { deviceId: cameraDeviceId ? { exact: cameraDeviceId } : undefined, width: { ideal: 960 }, height: { ideal: 540 } },
+      video: {
+        deviceId: cameraDeviceId ? { exact: cameraDeviceId } : undefined,
+        width: { ideal: separateCamera ? 1280 : 960 },
+        height: { ideal: separateCamera ? 720 : 540 },
+        frameRate: { ideal: 30 },
+      },
     }).catch(() => null);
     streamsRef.current = [displayStream, micStream, cameraStream].filter((stream): stream is MediaStream => Boolean(stream));
+    cameraSourceRef.current = cameraStream;
+
+    let camera: PreparedCamera | undefined;
+    let note: string | undefined;
+    if (separateCamera) {
+      const cameraMimeType = cameraStream ? pickCameraRecorderMimeType((candidate) => MediaRecorder.isTypeSupported(candidate)) : null;
+      if (cameraStream && cameraMimeType) {
+        const clone = new MediaStream(cameraStream.getVideoTracks().map((track) => track.clone()));
+        streamsRef.current.push(clone);
+        camera = { stream: clone, mimeType: cameraMimeType };
+      } else {
+        note = cameraStream ? "Camera recording is not supported here; recording the screen only." : "Camera could not be opened; recording the screen only.";
+        cameraStream?.getTracks().forEach((track) => track.stop());
+        cameraSourceRef.current = null;
+      }
+    }
 
     const screenVideo = document.createElement("video");
     screenVideo.srcObject = displayStream;
     screenVideo.muted = true;
     await screenVideo.play();
     const cameraVideo = document.createElement("video");
-    if (cameraStream) {
+    if (cameraStream && burnCamera) {
       cameraVideo.srcObject = cameraStream;
       cameraVideo.muted = true;
       await cameraVideo.play();
@@ -299,7 +369,7 @@ function App() {
 
     const draw = () => {
       context.drawImage(screenVideo, 0, 0, canvas.width, canvas.height);
-      if (cameraStream && cameraSize !== "off") {
+      if (cameraStream && burnCamera && cameraSize !== "off") {
         const ratios = { small: 0.14, medium: 0.2, large: 0.27 } as const;
         const size = Math.round(canvas.width * ratios[cameraSize]);
         const margin = Math.round(canvas.width * 0.025);
@@ -340,6 +410,8 @@ function App() {
     return {
       output,
       mimeType,
+      camera,
+      note,
       options: {
         sourceId: source.id,
         sourceName: source.name,
@@ -347,8 +419,11 @@ function App() {
         includeSystemAudio: systemAudioIncluded,
         microphoneDeviceId: microphoneDeviceId || undefined,
         cameraDeviceId: cameraDeviceId || undefined,
-        cameraSize,
+        // A camera that could not be recorded separately is not advertised in the saved layout.
+        cameraSize: separateCamera && !camera ? "off" : cameraSize,
         cameraCorner,
+        cameraShape,
+        cameraMode: (burnCamera ? "burned-in" : "separate") satisfies CameraMode,
       },
     };
   };
@@ -384,7 +459,12 @@ function App() {
         return;
       }
 
-      const manifest = await window.zapture.beginRecording(prepared.options, prepared.mimeType);
+      // The measured start offset is reported once both recorders have fired `start`.
+      const manifest = await window.zapture.beginRecording(
+        prepared.options,
+        prepared.mimeType,
+        prepared.camera ? { mimeType: prepared.camera.mimeType, startOffsetMs: 0, aspect: cameraAspectOf(cameraSourceRef.current) } : undefined,
+      );
       const recorder = new MediaRecorder(prepared.output, { mimeType: prepared.mimeType, videoBitsPerSecond: 3_500_000, audioBitsPerSecond: 128_000 });
       recorder.ondataavailable = (event) => {
         if (!event.data.size) return;
@@ -396,14 +476,54 @@ function App() {
           if (updated.totalSize >= MAX_UPLOAD_SIZE_BYTES || updated.durationMs >= MAX_RECORDING_DURATION_MS) await stopRecording();
         });
       };
+      const startedAt = (target: MediaRecorder) => new Promise<number>((resolve) => {
+        target.addEventListener("start", () => resolve(performance.now()), { once: true });
+      });
+      let cameraRecorder: MediaRecorder | null = null;
+      if (prepared.camera) {
+        try {
+          cameraRecorder = new MediaRecorder(prepared.camera.stream, { mimeType: prepared.camera.mimeType, videoBitsPerSecond: CAMERA_VIDEO_BITRATE });
+        } catch {
+          cameraRecorder = null;
+          setStatus("Camera recording is not supported here; recording the screen only.");
+        }
+      }
+      if (cameraRecorder) {
+        const activeCameraRecorder = cameraRecorder;
+        activeCameraRecorder.ondataavailable = (event) => {
+          if (!event.data.size) return;
+          cameraWriteChainRef.current = (cameraWriteChainRef.current ?? Promise.resolve()).then(async () => {
+            if (activeCameraRecorder.state === "inactive" && cameraRecorderRef.current !== activeCameraRecorder) return;
+            try {
+              await window.zapture.appendCameraChunk(manifest.id, await event.data.arrayBuffer());
+            } catch (error) {
+              // A camera write failure ends only the camera track; the screen recording continues.
+              if (activeCameraRecorder.state !== "inactive") activeCameraRecorder.stop();
+              await window.zapture.reportCameraTrack(manifest.id, { error: error instanceof Error ? error.message : "Camera write failed" }).catch(() => undefined);
+              setStatus("Camera track stopped after an error; the screen is still recording.");
+            }
+          });
+        };
+        cameraRecorderRef.current = activeCameraRecorder;
+      }
+      const screenStarted = startedAt(recorder);
+      const cameraStarted = cameraRecorder ? startedAt(cameraRecorder) : null;
+      // Back to back and synchronous so the two files begin as close together as possible.
       recorder.start(RECORDING_TIMESLICE_MS);
+      cameraRecorder?.start(RECORDING_TIMESLICE_MS);
+      if (cameraStarted) {
+        void Promise.all([screenStarted, cameraStarted]).then(([screenAt, cameraAt]) =>
+          window.zapture.reportCameraTrack(manifest.id, { startOffsetMs: clampCameraOffsetMs(cameraAt - screenAt) }),
+        ).catch(() => undefined);
+      }
       recorderRef.current = recorder;
       activeRecordingRef.current = manifest;
       setActiveRecording(manifest);
       setElapsedMs(0);
-      setStatus(prepared.options.includeSystemAudio || !includeSystemAudio
-        ? "Recording. Media is saved locally as you go."
-        : "Recording without system audio. Media is saved locally as you go.");
+      setStatus(prepared.note
+        ?? (prepared.options.includeSystemAudio || !includeSystemAudio
+          ? "Recording. Media is saved locally as you go."
+          : "Recording without system audio. Media is saved locally as you go."));
     } catch (error) {
       cleanupCapture();
       setStatus(error instanceof Error ? error.message : "Could not start recording.");
@@ -416,9 +536,14 @@ function App() {
     const recorder = recorderRef.current;
     const recording = activeRecordingRef.current;
     if (!recorder || !recording || stoppingRef.current) return;
-    if (paused && recorder.state === "recording") recorder.pause();
-    else if (!paused && recorder.state === "paused") recorder.resume();
-    else return;
+    const cameraRecorder = cameraRecorderRef.current;
+    if (paused && recorder.state === "recording") {
+      recorder.pause();
+      if (cameraRecorder?.state === "recording") cameraRecorder.pause();
+    } else if (!paused && recorder.state === "paused") {
+      recorder.resume();
+      if (cameraRecorder?.state === "paused") cameraRecorder.resume();
+    } else return;
     const updated = await window.zapture.setRecordingStatus(recording.id, paused ? "paused" : "recording");
     activeRecordingRef.current = updated;
     setActiveRecording(updated);
@@ -599,6 +724,18 @@ function App() {
                   ))}
                 </div>
               </div>
+              <div className="field">
+                <span id="camera-shape-label">Shape</span>
+                <div className="segmented segmented-fill" role="radiogroup" aria-labelledby="camera-shape-label">
+                  {CAMERA_SHAPES.map((shape) => (
+                    <button type="button" role="radio" aria-checked={shape.value === cameraShape} key={shape.value} disabled={cameraSize === "off" || burnCamera} onClick={() => setCameraShape(shape.value)}>{shape.label}</button>
+                  ))}
+                </div>
+              </div>
+              <label className="switch-row">
+                <span>Burn camera into video</span>
+                <input type="checkbox" role="switch" checked={burnCamera} disabled={cameraSize === "off"} onChange={(event) => setBurnCamera(event.target.checked)} />
+              </label>
             </fieldset>
 
             {devicesNeedAccess ? (

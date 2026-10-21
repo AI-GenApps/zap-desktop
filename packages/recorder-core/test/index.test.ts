@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildUploadParts, extensionFromMimeType, pauseTimingFor, pickRecorderMimeType, recordingDuration } from "../src";
+import { buildUploadParts, cameraLayoutFromOptions, clampCameraOffsetMs, pickCameraRecorderMimeType, extensionFromMimeType, pauseTimingFor, pickRecorderMimeType, recordingDuration } from "../src";
 
 async function* chunks(values: number[][]) {
   for (const value of values) yield Uint8Array.from(value);
@@ -48,5 +48,33 @@ describe("recording timing", () => {
     const paused = pauseTimingFor({}, "paused", 10_000);
     expect(pauseTimingFor(paused, "paused", 12_000)).toEqual(paused);
     expect(pauseTimingFor({ pausedMs: 3_000 }, "recording", 12_000)).toEqual({ pausedAt: undefined, pausedMs: 3_000 });
+  });
+});
+
+describe("camera helpers", () => {
+  const base = { cameraSize: "medium", cameraCorner: "bottom-left" } as const;
+
+  it("derives the separate-track layout with defaults", () => {
+    expect(cameraLayoutFromOptions(base)).toEqual({ visible: true, corner: "bottom-left", size: "medium", shape: "circle" });
+    expect(cameraLayoutFromOptions({ ...base, cameraSize: "large", cameraCorner: "top-right", cameraShape: "rounded", cameraMode: "separate" }))
+      .toEqual({ visible: true, corner: "top-right", size: "large", shape: "rounded" });
+  });
+
+  it("returns no layout when off or burned in", () => {
+    expect(cameraLayoutFromOptions({ ...base, cameraSize: "off" })).toBeNull();
+    expect(cameraLayoutFromOptions({ ...base, cameraMode: "burned-in" })).toBeNull();
+  });
+
+  it("clamps and rounds the start offset", () => {
+    expect(clampCameraOffsetMs(12.6)).toBe(13);
+    expect(clampCameraOffsetMs(5_000)).toBe(2_000);
+    expect(clampCameraOffsetMs(-9_000)).toBe(-2_000);
+    expect(clampCameraOffsetMs(Number.NaN)).toBe(0);
+  });
+
+  it("prefers vp8 webm for the camera", () => {
+    expect(pickCameraRecorderMimeType(() => true)).toBe("video/webm;codecs=vp8");
+    expect(pickCameraRecorderMimeType((v) => v === "video/webm")).toBe("video/webm");
+    expect(pickCameraRecorderMimeType(() => false)).toBeNull();
   });
 });

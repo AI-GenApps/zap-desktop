@@ -79,6 +79,14 @@ const optionsSchema = z.object({
   cameraDeviceId: z.string().optional(),
   cameraSize: z.enum(["off", "small", "medium", "large"]),
   cameraCorner: z.enum(["top-left", "top-right", "bottom-left", "bottom-right"]),
+  cameraShape: z.enum(["circle", "rounded"]).optional(),
+  cameraMode: z.enum(["separate", "burned-in"]).optional(),
+});
+
+const cameraTrackSchema = z.object({
+  mimeType: z.string().min(1),
+  startOffsetMs: z.number().finite(),
+  aspect: z.number().finite(),
 });
 
 const hudStateSchema = z.object({
@@ -540,7 +548,24 @@ function registerIpc() {
       thumbnail: source.thumbnail.toDataURL(),
     }));
   });
-  ipcMain.handle("desktop:begin-recording", (_event, options, mimeType) => store.create(optionsSchema.parse(options), z.string().min(1).parse(mimeType)));
+  ipcMain.handle("desktop:begin-recording", (_event, options, mimeType, camera) => store.create(
+    optionsSchema.parse(options),
+    z.string().min(1).parse(mimeType),
+    cameraTrackSchema.optional().parse(camera ?? undefined),
+  ));
+  ipcMain.handle("desktop:append-camera-chunk", (_event, id, chunk) => store.appendCameraChunk(z.string().uuid().parse(id), new Uint8Array(chunk)));
+  ipcMain.handle("desktop:report-camera-track", async (_event, id, report) => {
+    const parsed = z.object({
+      error: z.string().max(500).optional(),
+      aspect: z.number().finite().optional(),
+      startOffsetMs: z.number().finite().optional(),
+    }).parse(report);
+    const recordingId = z.string().uuid().parse(id);
+    if (parsed.aspect !== undefined || parsed.startOffsetMs !== undefined) {
+      await store.setCameraInfo(recordingId, { aspect: parsed.aspect, startOffsetMs: parsed.startOffsetMs });
+    }
+    if (parsed.error) await store.setCameraError(recordingId, parsed.error);
+  });
   ipcMain.handle("desktop:append-chunk", (_event, id, chunk) => store.appendChunk(z.string().uuid().parse(id), new Uint8Array(chunk)));
   ipcMain.handle("desktop:set-status", (_event, id, status) => store.setStatus(z.string().uuid().parse(id), z.enum(["paused", "recording"]).parse(status)));
   ipcMain.handle("desktop:finalize", (_event, id) => store.finalize(z.string().uuid().parse(id)));

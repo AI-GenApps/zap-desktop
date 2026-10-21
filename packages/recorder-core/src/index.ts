@@ -3,9 +3,16 @@ export const MAX_RECORDING_DURATION_MS = 60 * 60 * 1_000;
 export const MAX_UPLOAD_SIZE_BYTES = 5 * 1_024 * 1_024 * 1_024;
 export const UPLOAD_PART_SIZE_BYTES = 8 * 1_024 * 1_024;
 
+/** Must match the video-handler camera upload part size. */
+export const CAMERA_PART_SIZE_BYTES = UPLOAD_PART_SIZE_BYTES;
+export const CAMERA_MAX_OFFSET_MS = 2_000;
+
 export type CaptureMode = "screen" | "window";
 export type CameraSize = "off" | "small" | "medium" | "large";
 export type CameraCorner = "top-left" | "top-right" | "bottom-left" | "bottom-right";
+export type CameraShape = "circle" | "rounded";
+/** `separate` records the camera as its own file; `burned-in` composites it into the screen video. */
+export type CameraMode = "separate" | "burned-in";
 export type RecordingStatus =
   | "recording"
   | "paused"
@@ -24,6 +31,32 @@ export interface RecordingOptions {
   cameraDeviceId?: string;
   cameraSize: CameraSize;
   cameraCorner: CameraCorner;
+  /** Absent in old manifests; treated as "circle". */
+  cameraShape?: CameraShape;
+  /** Absent in old manifests; treated as "separate" when a camera is on. */
+  cameraMode?: CameraMode;
+}
+
+export interface CameraLayout {
+  visible: boolean;
+  corner: CameraCorner;
+  size: Exclude<CameraSize, "off">;
+  shape: CameraShape;
+}
+
+export interface CameraTrackManifest {
+  mimeType: string;
+  extension: "webm" | "mp4";
+  chunkCount: number;
+  totalSize: number;
+  /** cameraRecorderStartedAt - screenRecorderStartedAt, clamped; positive means the camera started later. */
+  startOffsetMs: number;
+  /** Width / height of the camera frames. */
+  aspect: number;
+  finalFile?: string;
+  uploaded?: boolean;
+  /** Camera-only failure; never blocks the screen recording. */
+  error?: string;
 }
 
 export interface RecordingManifest {
@@ -45,6 +78,7 @@ export interface RecordingManifest {
   videoId?: string;
   shareUrl?: string;
   error?: string;
+  camera?: CameraTrackManifest;
 }
 
 export interface UploadPart {
@@ -118,4 +152,22 @@ export function pauseTimingFor(
   if (status === "paused") return { pausedAt: timing.pausedAt ?? now, pausedMs: timing.pausedMs ?? 0 };
   const completed = timing.pausedAt ? Math.max(0, now - timing.pausedAt) : 0;
   return { pausedAt: undefined, pausedMs: (timing.pausedMs ?? 0) + completed };
+}
+
+/** Layout to publish for a separate camera track; null when there is no separate camera. */
+export function cameraLayoutFromOptions(
+  options: Pick<RecordingOptions, "cameraSize" | "cameraCorner" | "cameraShape" | "cameraMode">,
+): CameraLayout | null {
+  if (options.cameraSize === "off" || options.cameraMode === "burned-in") return null;
+  return { visible: true, corner: options.cameraCorner, size: options.cameraSize, shape: options.cameraShape ?? "circle" };
+}
+
+/** Clamps the camera start skew to an integer within +-2000 ms. */
+export function clampCameraOffsetMs(ms: number) {
+  if (!Number.isFinite(ms)) return 0;
+  return Math.max(-CAMERA_MAX_OFFSET_MS, Math.min(CAMERA_MAX_OFFSET_MS, Math.round(ms))) || 0;
+}
+
+export function pickCameraRecorderMimeType(isSupported: (mimeType: string) => boolean) {
+  return ["video/webm;codecs=vp8", "video/webm"].find(isSupported) ?? null;
 }

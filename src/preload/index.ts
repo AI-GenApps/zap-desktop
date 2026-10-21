@@ -4,8 +4,10 @@ import type { DesktopApi, MenuCommand, RecordingCommand, RecordingHudState, Uplo
 const api: DesktopApi = {
   platform: process.platform,
   getSources: () => ipcRenderer.invoke("desktop:get-sources"),
-  beginRecording: (options, mimeType) => ipcRenderer.invoke("desktop:begin-recording", options, mimeType),
+  beginRecording: (options, mimeType, camera) => ipcRenderer.invoke("desktop:begin-recording", options, mimeType, camera),
   appendChunk: (id, chunk) => ipcRenderer.invoke("desktop:append-chunk", id, chunk),
+  appendCameraChunk: (id, chunk) => ipcRenderer.invoke("desktop:append-camera-chunk", id, chunk),
+  reportCameraTrack: (id, report) => ipcRenderer.invoke("desktop:report-camera-track", id, report),
   setRecordingStatus: (id, status) => ipcRenderer.invoke("desktop:set-status", id, status),
   finalizeRecording: (id) => ipcRenderer.invoke("desktop:finalize", id),
   deleteRecording: (id) => ipcRenderer.invoke("desktop:delete", id),
