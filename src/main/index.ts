@@ -40,6 +40,15 @@ import { uploadRecording } from "./uploader";
 const API_BASE_URL = "https://zapture.app";
 const AUTH_ORIGIN = "https://auth.w3dev.app";
 const partition = "persist:zapture";
+
+// Development runs as the stock Electron app; use the product name for the
+// About panel and menus, but keep the existing development data directory.
+if (!app.isPackaged) {
+  const userData = app.getPath("userData");
+  app.setName("Zapture");
+  app.setPath("userData", userData);
+}
+
 const isMac = process.platform === "darwin";
 const RECORD_SHORTCUT = "CommandOrControl+Shift+5";
 const HUD_SIZE = { width: 320, height: 64 };

@@ -5,7 +5,7 @@
   "type": "module",
   "main": "out/main/index.js",
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "node scripts/brand-dev-electron.mjs && electron-vite dev",
     "build": "electron-vite build && bun run check:runtime-bundle",
     "check:runtime-bundle": "node scripts/check-runtime-bundle.mjs",
     "lint": "bun run typecheck",
