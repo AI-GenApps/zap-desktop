@@ -22,12 +22,13 @@ import { RecordingHud } from "./hud";
 import { Onboarding } from "./onboarding";
 import "./styles.css";
 
-const CAMERA_SIZES: { value: CameraSize; label: string }[] = [
-  { value: "off", label: "Off" },
+const CAMERA_SIZES: { value: Exclude<CameraSize, "off">; label: string }[] = [
   { value: "small", label: "S" },
   { value: "medium", label: "M" },
   { value: "large", label: "L" },
 ];
+/** Device-select value for recording the screen only. Real device IDs are opaque hashes, never this. */
+const NO_CAMERA = "none";
 const CAMERA_SHAPES: { value: CameraShape; label: string }[] = [
   { value: "circle", label: "Circle" },
   { value: "rounded", label: "Rounded" },
@@ -119,6 +120,8 @@ function App() {
   const [microphoneDeviceId, setMicrophoneDeviceId] = useState("");
   const [cameraDeviceId, setCameraDeviceId] = useState("");
   const [cameraSize, setCameraSize] = useState<CameraSize>("medium");
+  // Size to restore when the user picks a camera again after "None".
+  const lastCameraSizeRef = useRef<Exclude<CameraSize, "off">>("medium");
   const [cameraCorner, setCameraCorner] = useState<CameraCorner>("bottom-left");
   const [cameraShape, setCameraShape] = useState<CameraShape>("circle");
   const [burnCamera, setBurnCamera] = useState(false);
@@ -246,7 +249,7 @@ function App() {
 
   const deviceSummary = useMemo(() => {
     const microphone = microphones.find((device) => device.deviceId === microphoneDeviceId)?.label || "Default microphone";
-    const camera = cameraSize === "off" ? "Camera off" : cameras.find((device) => device.deviceId === cameraDeviceId)?.label || "Default camera";
+    const camera = cameraSize === "off" ? "No camera" : cameras.find((device) => device.deviceId === cameraDeviceId)?.label || "Default camera";
     return `${microphone} · ${camera}`;
   }, [cameraDeviceId, cameraSize, cameras, microphoneDeviceId, microphones]);
 
@@ -695,7 +698,19 @@ function App() {
               <legend>Camera</legend>
               <label className="field">
                 <span>Device</span>
-                <select value={cameraDeviceId} onChange={(event) => setCameraDeviceId(event.target.value)} disabled={cameraSize === "off"}>
+                <select
+                  value={cameraSize === "off" ? NO_CAMERA : cameraDeviceId}
+                  onChange={(event) => {
+                    if (event.target.value === NO_CAMERA) {
+                      if (cameraSize !== "off") lastCameraSizeRef.current = cameraSize;
+                      setCameraSize("off");
+                      return;
+                    }
+                    setCameraDeviceId(event.target.value);
+                    if (cameraSize === "off") setCameraSize(lastCameraSizeRef.current);
+                  }}
+                >
+                  <option value={NO_CAMERA}>None (screen only)</option>
                   <option value="">Default camera</option>
                   {cameras.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}
                 </select>
@@ -704,7 +719,7 @@ function App() {
                 <span id="camera-size-label">Size</span>
                 <div className="segmented segmented-fill" role="radiogroup" aria-labelledby="camera-size-label">
                   {CAMERA_SIZES.map((size) => (
-                    <button type="button" role="radio" aria-checked={size.value === cameraSize} key={size.value} onClick={() => setCameraSize(size.value)}>{size.label}</button>
+                    <button type="button" role="radio" aria-checked={size.value === cameraSize} key={size.value} disabled={cameraSize === "off"} onClick={() => setCameraSize(size.value)}>{size.label}</button>
                   ))}
                 </div>
               </div>
