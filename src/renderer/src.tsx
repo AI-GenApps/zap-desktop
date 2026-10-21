@@ -5,69 +5,89 @@ import {
   MAX_UPLOAD_SIZE_BYTES,
   RECORDING_TIMESLICE_MS,
   pickRecorderMimeType,
+  recordingDuration,
   type CameraCorner,
   type CameraSize,
   type RecordingManifest,
   type RecordingOptions,
 } from "@zapture/recorder-core";
-import type { AuthMode, AuthState, CaptureSource, MediaDeviceOption, UploadProgress } from "../shared/contracts";
+import type { AuthMode, AuthState, CaptureSource, MediaDeviceOption, RecordingCommand, UploadProgress } from "../shared/contracts";
 import { requestDisplayStream } from "./display-capture.util";
+import { formatBytes, formatDuration } from "./format.util";
+import { RecordingHud } from "./hud";
 import { Onboarding } from "./onboarding";
 import "./styles.css";
 
-const CAMERA_SIZES: CameraSize[] = ["off", "small", "medium", "large"];
+const CAMERA_SIZES: { value: CameraSize; label: string }[] = [
+  { value: "off", label: "Off" },
+  { value: "small", label: "S" },
+  { value: "medium", label: "M" },
+  { value: "large", label: "L" },
+];
 const CORNERS: CameraCorner[] = ["top-left", "top-right", "bottom-left", "bottom-right"];
+const COUNTDOWN_SECONDS = 3;
+const COMPOSITOR_FPS = 30;
 
-function formatBytes(bytes: number) {
-  if (!bytes) return "0 MB";
-  const units = ["B", "KB", "MB", "GB"];
-  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  return `${(bytes / 1024 ** index).toFixed(index > 1 ? 1 : 0)} ${units[index]}`;
-}
-
-function formatDuration(ms: number) {
-  const seconds = Math.max(0, Math.floor(ms / 1_000));
-  return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+interface PreparedCapture {
+  output: MediaStream;
+  mimeType: string;
+  options: RecordingOptions;
 }
 
 function SourceCard({ source, selected, onSelect }: { source: CaptureSource; selected: boolean; onSelect: () => void }) {
   return (
-    <button className={`source-card ${selected ? "selected" : ""}`} onClick={onSelect} type="button">
-      <img src={source.thumbnail} alt="" />
-      <span>{source.name}</span>
-      <small>{source.kind}</small>
+    <button className="source-card" aria-pressed={selected} onClick={onSelect} type="button" title={source.name}>
+      <span className="source-thumb"><img src={source.thumbnail} alt="" draggable={false} /></span>
+      <span className="source-name">{source.name}</span>
     </button>
   );
 }
 
-function RecordingRow({ recording, onUpload, onEdit, onDelete }: {
+function RecordingRow({ recording, uploadProgress, busy, onUpload, onEdit, onDelete }: {
   recording: RecordingManifest;
+  uploadProgress?: UploadProgress;
+  busy: boolean;
   onUpload: () => void;
   onEdit: () => void;
   onDelete: () => void;
 }) {
+  const started = new Date(recording.startedAt);
+  const uploading = recording.status === "uploading" && uploadProgress;
   return (
-    <article className="recording-row">
-      <div className="recording-index">{new Date(recording.startedAt).toLocaleDateString(undefined, { month: "short", day: "2-digit" })}</div>
-      <div>
+    <li className="recording-row">
+      <span className="recording-icon" aria-hidden="true"><FilmIcon /></span>
+      <div className="recording-meta">
         <strong>{recording.options.sourceName}</strong>
-        <p>{formatDuration(recording.durationMs)} · {formatBytes(recording.totalSize)} · {recording.status}</p>
+        <span>
+          {started.toLocaleDateString(undefined, { month: "short", day: "numeric" })}, {started.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}
+          {" · "}{formatDuration(recording.durationMs)} · {formatBytes(recording.totalSize)}
+        </span>
+        {uploading ? (
+          <span className="row-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(uploadProgress.uploadedBytes / Math.max(1, uploadProgress.totalBytes) * 100)}>
+            <b style={{ width: `${uploadProgress.totalBytes ? uploadProgress.uploadedBytes / uploadProgress.totalBytes * 100 : 0}%` }} />
+          </span>
+        ) : null}
+        {recording.status === "failed" && recording.error ? <span className="row-error">{recording.error}</span> : null}
       </div>
+      <span className={`badge badge-${recording.status}`}>{recording.status}</span>
       <div className="row-actions">
-        {recording.status === "uploaded" && recording.videoId ? <button onClick={onEdit}>Edit</button> : null}
-        {["ready", "failed"].includes(recording.status) ? <button className="accent" onClick={onUpload}>Upload</button> : null}
-        <button className="quiet" onClick={onDelete}>Delete</button>
+        {recording.status === "uploaded" && recording.videoId ? <button className="btn" onClick={onEdit}>Edit</button> : null}
+        {["ready", "failed"].includes(recording.status) ? <button className="btn btn-primary" onClick={onUpload} disabled={busy}>Upload</button> : null}
+        <button className="btn btn-plain" onClick={onDelete} disabled={recording.status === "uploading"} aria-label="Delete recording" title="Delete"><TrashIcon /></button>
       </div>
-    </article>
+    </li>
   );
 }
 
 function App() {
   const [view, setView] = useState<"loading" | "onboarding" | "recorder">("loading");
+  const [tab, setTab] = useState<"record" | "library">("record");
+  const [sourceKind, setSourceKind] = useState<CaptureSource["kind"]>("screen");
   const [sources, setSources] = useState<CaptureSource[]>([]);
   const [selectedSource, setSelectedSource] = useState<CaptureSource>();
   const [microphones, setMicrophones] = useState<MediaDeviceOption[]>([]);
   const [cameras, setCameras] = useState<MediaDeviceOption[]>([]);
+  const [devicesNeedAccess, setDevicesNeedAccess] = useState(false);
   const [microphoneDeviceId, setMicrophoneDeviceId] = useState("");
   const [cameraDeviceId, setCameraDeviceId] = useState("");
   const [cameraSize, setCameraSize] = useState<CameraSize>("medium");
@@ -75,9 +95,11 @@ function App() {
   const [includeSystemAudio, setIncludeSystemAudio] = useState(true);
   const [recordings, setRecordings] = useState<RecordingManifest[]>([]);
   const [activeRecording, setActiveRecording] = useState<RecordingManifest>();
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const [stopping, setStopping] = useState(false);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [auth, setAuth] = useState<AuthState>({ authenticated: false, canUpload: false });
-  const [status, setStatus] = useState("Choose a screen or window to begin.");
+  const [status, setStatus] = useState("Choose a screen or window to record.");
   const [busy, setBusy] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress>();
   const [authError, setAuthError] = useState<string>();
@@ -85,11 +107,12 @@ function App() {
   const activeRecordingRef = useRef<RecordingManifest | null>(null);
   const streamsRef = useRef<MediaStream[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const animationRef = useRef<number | null>(null);
+  const compositorRef = useRef<number | null>(null);
   const stoppingRef = useRef(false);
   const writeChainRef = useRef<Promise<void> | null>(null);
-  const transportRef = useRef<HTMLElement | null>(null);
+  const cancelCountdownRef = useRef<(() => void) | null>(null);
   const startButtonRef = useRef<HTMLButtonElement | null>(null);
+  const commandsRef = useRef<Record<RecordingCommand | "stop-recording", () => void>>(null!);
 
   const refreshRecordings = useCallback(async () => setRecordings(await window.zapture.listRecordings()), []);
 
@@ -98,8 +121,8 @@ function App() {
     try {
       const next = await window.zapture.getSources();
       setSources(next);
-      setSelectedSource((current) => next.find((source) => source.id === current?.id) ?? next[0]);
-      setStatus(next.length ? "Source list refreshed." : "No recordable sources were found.");
+      setSelectedSource((current) => next.find((source) => source.id === current?.id) ?? next.find((source) => source.kind === "screen") ?? next[0]);
+      if (!next.length) setStatus("No recordable screens or windows were found.");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Could not load capture sources.");
     } finally {
@@ -107,14 +130,18 @@ function App() {
     }
   }, []);
 
-  const refreshDevices = useCallback(async () => {
-    try {
-      const probe = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-      probe.getTracks().forEach((track) => track.stop());
-    } catch {
-      setStatus("Camera or microphone permission was not granted. You can still record the screen.");
+  const refreshDevices = useCallback(async (requestAccess: boolean) => {
+    if (requestAccess) {
+      try {
+        const probe = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        probe.getTracks().forEach((track) => track.stop());
+      } catch {
+        setStatus("Camera or microphone access was not granted. You can still record the screen.");
+      }
     }
     const devices = await navigator.mediaDevices.enumerateDevices();
+    const inputs = devices.filter((device) => device.kind === "audioinput" || device.kind === "videoinput");
+    setDevicesNeedAccess(inputs.some((device) => !device.label));
     setMicrophones(devices.filter((device) => device.kind === "audioinput").map((device, index) => ({ deviceId: device.deviceId, label: device.label || `Microphone ${index + 1}` })));
     setCameras(devices.filter((device) => device.kind === "videoinput").map((device, index) => ({ deviceId: device.deviceId, label: device.label || `Camera ${index + 1}` })));
   }, []);
@@ -126,41 +153,63 @@ function App() {
       setAuth(state);
       setView(state.authenticated ? "recorder" : "onboarding");
     });
-    const unsubscribeUpload = window.zapture.onUploadProgress(setUploadProgress);
-    const unsubscribeAuth = window.zapture.onAuthStateChanged((state) => {
-      setAuth(state);
-      if (state.authenticated) {
-        setAuthError(undefined);
+    const unsubscribers = [
+      window.zapture.onUploadProgress(setUploadProgress),
+      window.zapture.onAuthStateChanged((state) => {
+        setAuth(state);
+        if (state.authenticated) {
+          setAuthError(undefined);
+          setView("recorder");
+        } else {
+          setAuthError(state.error);
+          setView("onboarding");
+        }
+      }),
+      window.zapture.onPrepareRecording(() => {
         setView("recorder");
-      } else {
-        setAuthError(state.error);
-        setView("onboarding");
-      }
-    });
-    const unsubscribePrepare = window.zapture.onPrepareRecording(() => {
-      setView("recorder");
-      void refreshSources();
-      transportRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-      startButtonRef.current?.focus();
-    });
+        setTab("record");
+        void refreshSources();
+        startButtonRef.current?.focus();
+      }),
+      window.zapture.onRecordingCommand((command) => commandsRef.current[command]()),
+      window.zapture.onMenuCommand((command) => {
+        if (command === "show-library") setTab("library");
+        else commandsRef.current["stop-recording"]();
+      }),
+    ];
     return () => {
       disposed = true;
-      unsubscribeUpload();
-      unsubscribeAuth();
-      unsubscribePrepare();
+      unsubscribers.forEach((unsubscribe) => unsubscribe());
     };
   }, [refreshSources]);
 
   useEffect(() => {
     if (view !== "recorder") return;
-    void Promise.all([refreshSources(), refreshRecordings()]);
-  }, [refreshRecordings, refreshSources, view]);
+    void Promise.all([refreshSources(), refreshRecordings(), refreshDevices(false)]);
+  }, [refreshDevices, refreshRecordings, refreshSources, view]);
+
+  const isLive = activeRecording?.status === "recording" || activeRecording?.status === "paused";
 
   useEffect(() => {
-    if (!activeRecording || !["recording", "paused"].includes(activeRecording.status)) return;
-    const interval = window.setInterval(() => setElapsedMs(Date.now() - activeRecording.startedAt), 250);
+    if (!activeRecording || !isLive) return;
+    const tick = () => setElapsedMs(recordingDuration(activeRecording));
+    tick();
+    const interval = window.setInterval(tick, 250);
     return () => window.clearInterval(interval);
-  }, [activeRecording]);
+  }, [activeRecording, isLive]);
+
+  // Mirror recorder state into the floating HUD; `null` hides it and brings this window back.
+  useEffect(() => {
+    if (stopping) void window.zapture.setRecordingHud(null);
+    else if (countdown !== null) void window.zapture.setRecordingHud({ status: "countdown", countdown, elapsedMs: 0, updatedAt: Date.now() });
+    else if (activeRecording && isLive) {
+      void window.zapture.setRecordingHud({
+        status: activeRecording.status === "paused" ? "paused" : "recording",
+        elapsedMs: recordingDuration(activeRecording),
+        updatedAt: Date.now(),
+      });
+    } else void window.zapture.setRecordingHud(null);
+  }, [activeRecording, countdown, isLive, stopping]);
 
   const deviceSummary = useMemo(() => {
     const microphone = microphones.find((device) => device.deviceId === microphoneDeviceId)?.label || "Default microphone";
@@ -174,8 +223,8 @@ function App() {
       track.stop();
     }));
     streamsRef.current = [];
-    if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
-    animationRef.current = null;
+    if (compositorRef.current !== null) window.clearInterval(compositorRef.current);
+    compositorRef.current = null;
     void audioContextRef.current?.close();
     audioContextRef.current = null;
   }, []);
@@ -185,8 +234,9 @@ function App() {
     const recording = activeRecordingRef.current;
     if (!recorder || !recording || recorder.state === "inactive" || stoppingRef.current) return;
     stoppingRef.current = true;
+    setStopping(true);
     setBusy(true);
-    setStatus("Finalizing local recording…");
+    setStatus("Saving recording…");
     try {
       const stopped = new Promise<void>((resolve) => recorder.addEventListener("stop", () => resolve(), { once: true }));
       recorder.stop();
@@ -199,102 +249,143 @@ function App() {
       activeRecordingRef.current = null;
       setActiveRecording(undefined);
       setElapsedMs(0);
-      setStatus("Recording saved. Upload it when you are ready.");
+      setStatus(auth.authenticated ? "Recording saved. Upload it to share or edit." : "Recording saved on this computer.");
       await refreshRecordings();
+      setTab("library");
       return finalized;
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not finalize the recording.");
+      setStatus(error instanceof Error ? error.message : "Could not save the recording.");
       return undefined;
     } finally {
       stoppingRef.current = false;
+      setStopping(false);
       setBusy(false);
     }
-  }, [cleanupCapture, refreshRecordings]);
+  }, [auth.authenticated, cleanupCapture, refreshRecordings]);
 
-  const startRecording = async () => {
-    if (!selectedSource) return;
-    setBusy(true);
-    setStatus("Opening capture devices…");
-    try {
-      const { stream: displayStream, systemAudioIncluded } = await requestDisplayStream(
-        (requestSystemAudio) => navigator.mediaDevices.getUserMedia({
-          audio: requestSystemAudio ? { mandatory: { chromeMediaSource: "desktop", chromeMediaSourceId: selectedSource.id } } : false,
-          video: { mandatory: { chromeMediaSource: "desktop", chromeMediaSourceId: selectedSource.id, maxWidth: 1920, maxHeight: 1080, maxFrameRate: 30 } },
-        } as unknown as MediaStreamConstraints),
-        includeSystemAudio,
-      );
-      const micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { deviceId: microphoneDeviceId ? { exact: microphoneDeviceId } : undefined, echoCancellation: true, noiseSuppression: true },
-      }).catch(() => null);
-      const cameraStream = cameraSize === "off" ? null : await navigator.mediaDevices.getUserMedia({
-        video: { deviceId: cameraDeviceId ? { exact: cameraDeviceId } : undefined, width: { ideal: 960 }, height: { ideal: 540 } },
-      }).catch(() => null);
-      streamsRef.current = [displayStream, micStream, cameraStream].filter((stream): stream is MediaStream => Boolean(stream));
+  /** Opens devices and starts compositing so the countdown ends in an instant start. */
+  const prepareCapture = async (source: CaptureSource): Promise<PreparedCapture> => {
+    const { stream: displayStream, systemAudioIncluded } = await requestDisplayStream(
+      (requestSystemAudio) => navigator.mediaDevices.getUserMedia({
+        audio: requestSystemAudio ? { mandatory: { chromeMediaSource: "desktop", chromeMediaSourceId: source.id } } : false,
+        video: { mandatory: { chromeMediaSource: "desktop", chromeMediaSourceId: source.id, maxWidth: 1920, maxHeight: 1080, maxFrameRate: 30 } },
+      } as unknown as MediaStreamConstraints),
+      includeSystemAudio,
+    );
+    streamsRef.current = [displayStream];
+    const micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { deviceId: microphoneDeviceId ? { exact: microphoneDeviceId } : undefined, echoCancellation: true, noiseSuppression: true },
+    }).catch(() => null);
+    const cameraStream = cameraSize === "off" ? null : await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: cameraDeviceId ? { exact: cameraDeviceId } : undefined, width: { ideal: 960 }, height: { ideal: 540 } },
+    }).catch(() => null);
+    streamsRef.current = [displayStream, micStream, cameraStream].filter((stream): stream is MediaStream => Boolean(stream));
 
-      const screenVideo = document.createElement("video");
-      screenVideo.srcObject = displayStream;
-      screenVideo.muted = true;
-      await screenVideo.play();
-      const cameraVideo = document.createElement("video");
-      if (cameraStream) {
-        cameraVideo.srcObject = cameraStream;
-        cameraVideo.muted = true;
-        await cameraVideo.play();
+    const screenVideo = document.createElement("video");
+    screenVideo.srcObject = displayStream;
+    screenVideo.muted = true;
+    await screenVideo.play();
+    const cameraVideo = document.createElement("video");
+    if (cameraStream) {
+      cameraVideo.srcObject = cameraStream;
+      cameraVideo.muted = true;
+      await cameraVideo.play();
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = screenVideo.videoWidth || 1920;
+    canvas.height = screenVideo.videoHeight || 1080;
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) throw new Error("Could not initialize the video compositor");
+
+    const draw = () => {
+      context.drawImage(screenVideo, 0, 0, canvas.width, canvas.height);
+      if (cameraStream && cameraSize !== "off") {
+        const ratios = { small: 0.14, medium: 0.2, large: 0.27 } as const;
+        const size = Math.round(canvas.width * ratios[cameraSize]);
+        const margin = Math.round(canvas.width * 0.025);
+        const x = cameraCorner.endsWith("right") ? canvas.width - size - margin : margin;
+        const y = cameraCorner.startsWith("bottom") ? canvas.height - size - margin : margin;
+        context.save();
+        context.beginPath();
+        context.arc(x + size / 2, y + size / 2, size / 2, 0, Math.PI * 2);
+        context.clip();
+        context.drawImage(cameraVideo, x, y, size, size);
+        context.restore();
+        context.strokeStyle = "#f2efdf";
+        context.lineWidth = Math.max(4, Math.round(size * 0.025));
+        context.beginPath();
+        context.arc(x + size / 2, y + size / 2, size / 2 - context.lineWidth / 2, 0, Math.PI * 2);
+        context.stroke();
       }
-      const canvas = document.createElement("canvas");
-      canvas.width = screenVideo.videoWidth || 1920;
-      canvas.height = screenVideo.videoHeight || 1080;
-      const context = canvas.getContext("2d", { alpha: false });
-      if (!context) throw new Error("Could not initialize the video compositor");
+    };
+    draw();
+    // A timer rather than requestAnimationFrame: rAF stops while the window is
+    // hidden, which would freeze the recording behind the HUD.
+    compositorRef.current = window.setInterval(draw, 1_000 / COMPOSITOR_FPS);
 
-      const draw = () => {
-        context.drawImage(screenVideo, 0, 0, canvas.width, canvas.height);
-        if (cameraStream && cameraSize !== "off") {
-          const ratios = { small: 0.14, medium: 0.2, large: 0.27 } as const;
-          const size = Math.round(canvas.width * ratios[cameraSize]);
-          const margin = Math.round(canvas.width * 0.025);
-          const x = cameraCorner.endsWith("right") ? canvas.width - size - margin : margin;
-          const y = cameraCorner.startsWith("bottom") ? canvas.height - size - margin : margin;
-          context.save();
-          context.beginPath();
-          context.arc(x + size / 2, y + size / 2, size / 2, 0, Math.PI * 2);
-          context.clip();
-          context.drawImage(cameraVideo, x, y, size, size);
-          context.restore();
-          context.strokeStyle = "#f2efdf";
-          context.lineWidth = Math.max(4, Math.round(size * 0.025));
-          context.beginPath();
-          context.arc(x + size / 2, y + size / 2, size / 2 - context.lineWidth / 2, 0, Math.PI * 2);
-          context.stroke();
-        }
-        animationRef.current = requestAnimationFrame(draw);
-      };
-      draw();
+    const output = canvas.captureStream(COMPOSITOR_FPS);
+    const audioStreams = [displayStream, micStream].filter((stream): stream is MediaStream => Boolean(stream?.getAudioTracks().length));
+    if (audioStreams.length) {
+      const audioContext = new AudioContext();
+      audioContextRef.current = audioContext;
+      const destination = audioContext.createMediaStreamDestination();
+      for (const stream of audioStreams) audioContext.createMediaStreamSource(stream).connect(destination);
+      destination.stream.getAudioTracks().forEach((track) => output.addTrack(track));
+    }
 
-      const output = canvas.captureStream(30);
-      const audioStreams = [displayStream, micStream].filter((stream): stream is MediaStream => Boolean(stream?.getAudioTracks().length));
-      if (audioStreams.length) {
-        const audioContext = new AudioContext();
-        audioContextRef.current = audioContext;
-        const destination = audioContext.createMediaStreamDestination();
-        for (const stream of audioStreams) audioContext.createMediaStreamSource(stream).connect(destination);
-        destination.stream.getAudioTracks().forEach((track) => output.addTrack(track));
-      }
-
-      const mimeType = pickRecorderMimeType((candidate) => MediaRecorder.isTypeSupported(candidate));
-      if (!mimeType) throw new Error("This system has no supported recording format");
-      const options: RecordingOptions = {
-        sourceId: selectedSource.id,
-        sourceName: selectedSource.name,
-        captureMode: selectedSource.kind,
+    const mimeType = pickRecorderMimeType((candidate) => MediaRecorder.isTypeSupported(candidate));
+    if (!mimeType) throw new Error("This system has no supported recording format");
+    const displayTrack = displayStream.getVideoTracks()[0];
+    if (displayTrack) displayTrack.onended = () => void stopRecording();
+    return {
+      output,
+      mimeType,
+      options: {
+        sourceId: source.id,
+        sourceName: source.name,
+        captureMode: source.kind,
         includeSystemAudio: systemAudioIncluded,
         microphoneDeviceId: microphoneDeviceId || undefined,
         cameraDeviceId: cameraDeviceId || undefined,
         cameraSize,
         cameraCorner,
-      };
-      const manifest = await window.zapture.beginRecording(options, mimeType);
-      const recorder = new MediaRecorder(output, { mimeType, videoBitsPerSecond: 3_500_000, audioBitsPerSecond: 128_000 });
+      },
+    };
+  };
+
+  /** Resolves true when the countdown completes, false when cancelled. */
+  const runCountdown = () => new Promise<boolean>((resolve) => {
+    let remaining = COUNTDOWN_SECONDS;
+    setCountdown(remaining);
+    const interval = window.setInterval(() => {
+      remaining -= 1;
+      if (remaining > 0) setCountdown(remaining);
+      else finish(true);
+    }, 1_000);
+    const finish = (completed: boolean) => {
+      window.clearInterval(interval);
+      cancelCountdownRef.current = null;
+      setCountdown(null);
+      resolve(completed);
+    };
+    cancelCountdownRef.current = () => finish(false);
+  });
+
+  const startRecording = async () => {
+    if (!selectedSource || busy || activeRecordingRef.current) return;
+    setBusy(true);
+    setStatus("Opening capture devices…");
+    try {
+      const prepared = await prepareCapture(selectedSource);
+      setStatus("Recording starts in a moment. Press Esc to cancel.");
+      if (!(await runCountdown())) {
+        cleanupCapture();
+        setStatus("Recording cancelled.");
+        return;
+      }
+
+      const manifest = await window.zapture.beginRecording(prepared.options, prepared.mimeType);
+      const recorder = new MediaRecorder(prepared.output, { mimeType: prepared.mimeType, videoBitsPerSecond: 3_500_000, audioBitsPerSecond: 128_000 });
       recorder.ondataavailable = (event) => {
         if (!event.data.size) return;
         writeChainRef.current = (writeChainRef.current ?? Promise.resolve()).then(async () => {
@@ -305,16 +396,14 @@ function App() {
           if (updated.totalSize >= MAX_UPLOAD_SIZE_BYTES || updated.durationMs >= MAX_RECORDING_DURATION_MS) await stopRecording();
         });
       };
-      const displayTrack = displayStream.getVideoTracks()[0];
-      if (displayTrack) displayTrack.onended = () => void stopRecording();
       recorder.start(RECORDING_TIMESLICE_MS);
       recorderRef.current = recorder;
       activeRecordingRef.current = manifest;
       setActiveRecording(manifest);
       setElapsedMs(0);
-      setStatus(systemAudioIncluded || !includeSystemAudio
-        ? "Recording is live. Your media is being saved locally."
-        : "Recording is live without system audio. Your media is being saved locally.");
+      setStatus(prepared.options.includeSystemAudio || !includeSystemAudio
+        ? "Recording. Media is saved locally as you go."
+        : "Recording without system audio. Media is saved locally as you go.");
     } catch (error) {
       cleanupCapture();
       setStatus(error instanceof Error ? error.message : "Could not start recording.");
@@ -323,16 +412,37 @@ function App() {
     }
   };
 
-  const togglePause = async () => {
+  const setPaused = async (paused: boolean) => {
     const recorder = recorderRef.current;
-    if (!recorder || !activeRecording) return;
-    if (recorder.state === "recording") recorder.pause();
-    else recorder.resume();
-    const status = recorder.state === "paused" ? "paused" : "recording";
-    const updated = await window.zapture.setRecordingStatus(activeRecording.id, status);
+    const recording = activeRecordingRef.current;
+    if (!recorder || !recording || stoppingRef.current) return;
+    if (paused && recorder.state === "recording") recorder.pause();
+    else if (!paused && recorder.state === "paused") recorder.resume();
+    else return;
+    const updated = await window.zapture.setRecordingStatus(recording.id, paused ? "paused" : "recording");
     activeRecordingRef.current = updated;
     setActiveRecording(updated);
   };
+
+  commandsRef.current = {
+    pause: () => void setPaused(true),
+    resume: () => void setPaused(false),
+    stop: () => void stopRecording(),
+    "stop-recording": () => {
+      if (cancelCountdownRef.current) cancelCountdownRef.current();
+      else void stopRecording();
+    },
+    cancel: () => cancelCountdownRef.current?.(),
+  };
+
+  useEffect(() => {
+    if (countdown === null) return;
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") cancelCountdownRef.current?.();
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [countdown]);
 
   const runAuthentication = async (mode: AuthMode) => {
     setBusy(true);
@@ -373,13 +483,20 @@ function App() {
       setBusy(true);
       await window.zapture.uploadRecording(recording.id, title, "Recorded with Zapture desktop");
       await refreshRecordings();
-      setStatus("Upload verified. Open the editor to finish your video.");
+      setStatus("Upload verified. Choose Edit to finish your video.");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Upload failed.");
       await refreshRecordings();
     } finally {
       setBusy(false);
+      setUploadProgress(undefined);
     }
+  };
+
+  const deleteRecording = async (recording: RecordingManifest) => {
+    if (!window.confirm(`Delete the recording of “${recording.options.sourceName}”? This cannot be undone.`)) return;
+    await window.zapture.deleteRecording(recording.id);
+    await refreshRecordings();
   };
 
   if (view === "loading") return <main className="onboarding-shell onboarding-loading"><div className="onboarding-mark" aria-hidden="true"><span>Z</span></div></main>;
@@ -392,63 +509,173 @@ function App() {
     />
   );
 
+  const visibleSources = sources.filter((source) => source.kind === sourceKind);
+  const recording = isLive || countdown !== null || stopping;
+
   return (
-    <main className="app-shell">
-      <header className="masthead">
-        <div className="brand"><span className="brand-mark">Z</span><span>Zapture</span></div>
-        <div className="live-status"><i className={activeRecording?.status === "recording" ? "live" : ""} />{activeRecording ? activeRecording.status : "standby"}</div>
-        <div className="auth-slot">
-          {auth.authenticated ? <><span>{auth.user?.name || auth.user?.email}</span><button className="quiet" disabled={Boolean(activeRecording)} onClick={async () => { await window.zapture.signOut(); setAuth({ authenticated: false, canUpload: false }); setView("onboarding"); }}>Sign out</button></> : <button onClick={() => void runAuthentication("sign-in")}>Sign in</button>}
+    <div className="app-window">
+      <header className="toolbar">
+        <div className="toolbar-title"><span className="app-mark" aria-hidden="true">Z</span>Zapture</div>
+        <div className="tabs" role="tablist" aria-label="Sections">
+          <button type="button" role="tab" aria-selected={tab === "record"} onClick={() => setTab("record")}>Record</button>
+          <button type="button" role="tab" aria-selected={tab === "library"} onClick={() => setTab("library")}>
+            Library{recordings.length ? <span className="tab-count">{recordings.length}</span> : null}
+          </button>
+        </div>
+        <div className="toolbar-end">
+          {auth.authenticated ? (
+            <>
+              <span className="account" title={auth.user?.email}>{auth.user?.name || auth.user?.email}</span>
+              <button className="btn btn-plain" disabled={recording} onClick={async () => { await window.zapture.signOut(); setAuth({ authenticated: false, canUpload: false }); setView("onboarding"); }}>Sign Out</button>
+            </>
+          ) : <button className="btn" onClick={() => void runAuthentication("sign-in")} disabled={busy}>Sign In</button>}
         </div>
       </header>
 
-      <section className="hero-grid">
-        <div className="hero-copy">
-          <p className="eyebrow">DESKTOP CAPTURE / 01</p>
-          <h1>Record the work.<br /><em>Keep the context.</em></h1>
-          <p className="dek">A resilient recorder for walkthroughs, decisions, and the details that disappear in a meeting.</p>
+      {tab === "record" ? (
+        <div className="record-layout">
+          <section className="sources" aria-label="Capture source">
+            <div className="pane-bar">
+              <div className="segmented" role="radiogroup" aria-label="Source type">
+                <button type="button" role="radio" aria-checked={sourceKind === "screen"} onClick={() => setSourceKind("screen")}>Screens</button>
+                <button type="button" role="radio" aria-checked={sourceKind === "window"} onClick={() => setSourceKind("window")}>Windows</button>
+              </div>
+              <button type="button" className="btn btn-plain" onClick={() => void refreshSources()} disabled={busy || recording} title="Refresh sources"><RefreshIcon /> Refresh</button>
+            </div>
+            <div className="source-grid" data-kind={sourceKind}>
+              {visibleSources.map((source) => (
+                <SourceCard key={source.id} source={source} selected={source.id === selectedSource?.id} onSelect={() => !recording && setSelectedSource(source)} />
+              ))}
+              {!visibleSources.length ? <p className="empty">{sourceKind === "screen" ? "No screens found." : "No windows found."}</p> : null}
+            </div>
+          </section>
+
+          <aside className="inspector" aria-label="Recording settings">
+            <fieldset className="group" disabled={recording}>
+              <legend>Audio</legend>
+              <label className="field">
+                <span>Microphone</span>
+                <select value={microphoneDeviceId} onChange={(event) => setMicrophoneDeviceId(event.target.value)}>
+                  <option value="">Default microphone</option>
+                  {microphones.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}
+                </select>
+              </label>
+              <label className="switch-row">
+                <span>System audio</span>
+                <input type="checkbox" role="switch" checked={includeSystemAudio} onChange={(event) => setIncludeSystemAudio(event.target.checked)} />
+              </label>
+            </fieldset>
+
+            <fieldset className="group" disabled={recording}>
+              <legend>Camera</legend>
+              <label className="field">
+                <span>Device</span>
+                <select value={cameraDeviceId} onChange={(event) => setCameraDeviceId(event.target.value)} disabled={cameraSize === "off"}>
+                  <option value="">Default camera</option>
+                  {cameras.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}
+                </select>
+              </label>
+              <div className="field">
+                <span id="camera-size-label">Size</span>
+                <div className="segmented segmented-fill" role="radiogroup" aria-labelledby="camera-size-label">
+                  {CAMERA_SIZES.map((size) => (
+                    <button type="button" role="radio" aria-checked={size.value === cameraSize} key={size.value} onClick={() => setCameraSize(size.value)}>{size.label}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="field">
+                <span id="camera-corner-label">Position</span>
+                <div className="corner-picker" role="radiogroup" aria-labelledby="camera-corner-label">
+                  {CORNERS.map((corner) => (
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={corner === cameraCorner}
+                      aria-label={corner.replace("-", " ")}
+                      key={corner}
+                      disabled={cameraSize === "off"}
+                      onClick={() => setCameraCorner(corner)}
+                    ><i /></button>
+                  ))}
+                </div>
+              </div>
+            </fieldset>
+
+            {devicesNeedAccess ? (
+              <button type="button" className="link-button" onClick={() => void refreshDevices(true)}>Show device names…</button>
+            ) : null}
+            <p className="hint">{deviceSummary}</p>
+          </aside>
         </div>
-        <aside className="meter-panel">
-          <span>SESSION</span><strong>{formatDuration(elapsedMs)}</strong>
-          <div className="meter"><b style={{ width: `${Math.min(100, elapsedMs / MAX_RECORDING_DURATION_MS * 100)}%` }} /></div>
-          <small>60 minute local safety limit</small>
-        </aside>
-      </section>
+      ) : (
+        <section className="library" aria-label="Recordings">
+          {recordings.length ? (
+            <ul className="recording-list">
+              {recordings.map((item) => (
+                <RecordingRow
+                  key={item.id}
+                  recording={item}
+                  uploadProgress={uploadProgress}
+                  busy={busy}
+                  onUpload={() => void runUpload(item)}
+                  onEdit={() => item.videoId && void window.zapture.openEditor(item.videoId)}
+                  onDelete={() => void deleteRecording(item)}
+                />
+              ))}
+            </ul>
+          ) : (
+            <div className="empty-state">
+              <FilmIcon />
+              <p>No recordings yet</p>
+              <button className="btn" onClick={() => setTab("record")}>New Recording</button>
+            </div>
+          )}
+        </section>
+      )}
 
-      <section className="control-grid">
-        <div className="source-panel panel">
-          <div className="panel-heading"><div><span>01</span><h2>Capture source</h2></div><button onClick={refreshSources} disabled={busy}>Refresh</button></div>
-          <div className="source-grid">
-            {sources.map((source) => <SourceCard key={source.id} source={source} selected={source.id === selectedSource?.id} onSelect={() => setSelectedSource(source)} />)}
-          </div>
+      <footer className="transport">
+        <p className="status" role="status">{uploadProgress && busy ? uploadProgress.message : status}</p>
+        <div className="transport-controls">
+          {recording ? <span className={`timer ${activeRecording?.status === "paused" ? "timer-paused" : ""}`}>{formatDuration(elapsedMs)}</span> : null}
+          {countdown !== null ? null : isLive ? (
+            <>
+              <button className="btn" onClick={() => void setPaused(activeRecording?.status !== "paused")} disabled={stopping}>
+                {activeRecording?.status === "paused" ? "Resume" : "Pause"}
+              </button>
+              <button className="btn btn-stop" onClick={() => void stopRecording()} disabled={stopping}><span className="stop-glyph" aria-hidden="true" />Stop</button>
+            </>
+          ) : (
+            <button className="btn btn-record" ref={startButtonRef} onClick={() => void startRecording()} disabled={busy || !selectedSource}>
+              <span className="record-glyph" aria-hidden="true" />Start Recording
+            </button>
+          )}
         </div>
+      </footer>
 
-        <div className="setup-panel panel">
-          <div className="panel-heading"><div><span>02</span><h2>Signal setup</h2></div><button onClick={refreshDevices}>Detect devices</button></div>
-          <label>Microphone<select value={microphoneDeviceId} onChange={(event) => setMicrophoneDeviceId(event.target.value)}><option value="">Default microphone</option>{microphones.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}</select></label>
-          <label>Camera<select value={cameraDeviceId} onChange={(event) => setCameraDeviceId(event.target.value)} disabled={cameraSize === "off"}><option value="">Default camera</option>{cameras.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}</select></label>
-          <div className="segmented" aria-label="Camera size">{CAMERA_SIZES.map((size) => <button className={size === cameraSize ? "active" : ""} key={size} onClick={() => setCameraSize(size)}>{size}</button>)}</div>
-          <div className="segmented corners" aria-label="Camera corner">{CORNERS.map((corner) => <button className={corner === cameraCorner ? "active" : ""} key={corner} onClick={() => setCameraCorner(corner)}>{corner.replaceAll("-", " ")}</button>)}</div>
-          <label className="toggle"><input type="checkbox" checked={includeSystemAudio} onChange={(event) => setIncludeSystemAudio(event.target.checked)} /><span />Include system audio</label>
-          <p className="device-summary">{deviceSummary}</p>
+      {countdown !== null ? (
+        <div className="countdown-overlay" role="alert" aria-live="assertive">
+          <span className="countdown-number">{countdown}</span>
+          <button type="button" className="btn" onClick={() => cancelCountdownRef.current?.()}>Cancel</button>
+          <span className="countdown-hint">or press Esc</span>
         </div>
-      </section>
-
-      <section className="transport" ref={transportRef}>
-        <p>{status}</p>
-        <div>
-          {activeRecording ? <><button onClick={togglePause}>{activeRecording.status === "paused" ? "Resume" : "Pause"}</button><button className="record stop" onClick={() => void stopRecording()} disabled={busy}>Stop & save</button></> : <button className="record" ref={startButtonRef} onClick={() => void startRecording()} disabled={busy || !selectedSource}><span />Start recording</button>}
-        </div>
-      </section>
-
-      {uploadProgress ? <section className="upload-strip"><span>{uploadProgress.message}</span><div><b style={{ width: `${uploadProgress.totalBytes ? uploadProgress.uploadedBytes / uploadProgress.totalBytes * 100 : 0}%` }} /></div></section> : null}
-
-      <section className="library panel">
-        <div className="panel-heading"><div><span>03</span><h2>Local recordings</h2></div><button onClick={() => void window.zapture.checkForUpdates().then((result) => setStatus(result.message))}>Check for updates</button></div>
-        {recordings.length ? recordings.map((recording) => <RecordingRow key={recording.id} recording={recording} onUpload={() => void runUpload(recording)} onEdit={() => recording.videoId && void window.zapture.openEditor(recording.videoId)} onDelete={async () => { await window.zapture.deleteRecording(recording.id); await refreshRecordings(); }} />) : <div className="empty">No local takes yet. Your first recording will appear here.</div>}
-      </section>
-    </main>
+      ) : null}
+    </div>
   );
 }
 
-createRoot(document.getElementById("root")!).render(<StrictMode><App /></StrictMode>);
+function RefreshIcon() {
+  return <svg className="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>;
+}
+
+function TrashIcon() {
+  return <svg className="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" /></svg>;
+}
+
+function FilmIcon() {
+  return <svg className="icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3.5" width="9" height="9" rx="2" fill="none" stroke="currentColor" strokeWidth="1.3" /><path d="m11 7 3-1.8v5.6L11 9" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" /></svg>;
+}
+
+const isHud = window.location.hash === "#hud";
+document.documentElement.dataset.platform = window.zapture.platform;
+document.documentElement.dataset.surface = isHud ? "hud" : "app";
+createRoot(document.getElementById("root")!).render(<StrictMode>{isHud ? <RecordingHud /> : <App />}</StrictMode>);

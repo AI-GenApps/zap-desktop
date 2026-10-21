@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { DesktopApi, UploadProgress } from "../shared/contracts";
+import type { DesktopApi, MenuCommand, RecordingCommand, RecordingHudState, UploadProgress } from "../shared/contracts";
 
 const api: DesktopApi = {
   platform: process.platform,
@@ -31,6 +31,23 @@ const api: DesktopApi = {
     const handler = (_event: Electron.IpcRendererEvent, progress: UploadProgress) => listener(progress);
     ipcRenderer.on("desktop:upload-progress", handler);
     return () => ipcRenderer.removeListener("desktop:upload-progress", handler);
+  },
+  setRecordingHud: (state) => ipcRenderer.invoke("desktop:set-recording-hud", state),
+  sendRecordingCommand: (command) => ipcRenderer.invoke("desktop:recording-command", command),
+  onRecordingHud: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, state: RecordingHudState | null) => listener(state);
+    ipcRenderer.on("desktop:recording-hud", handler);
+    return () => ipcRenderer.removeListener("desktop:recording-hud", handler);
+  },
+  onRecordingCommand: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, command: RecordingCommand) => listener(command);
+    ipcRenderer.on("desktop:recording-command", handler);
+    return () => ipcRenderer.removeListener("desktop:recording-command", handler);
+  },
+  onMenuCommand: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, command: MenuCommand) => listener(command);
+    ipcRenderer.on("desktop:menu-command", handler);
+    return () => ipcRenderer.removeListener("desktop:menu-command", handler);
   },
 };
 

@@ -11,12 +11,15 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  nativeTheme,
+  screen,
   session,
   shell,
   systemPreferences,
   Tray,
+  type MenuItemConstructorOptions,
 } from "electron";
-import type { AuthMode, AuthState } from "../shared/contracts";
+import type { AuthMode, AuthState, MenuCommand, RecordingHudState } from "../shared/contracts";
 import {
   AUTH_ATTEMPT_TTL_MS,
   buildDesktopAuthRedirectUrl,
@@ -37,8 +40,13 @@ import { uploadRecording } from "./uploader";
 const API_BASE_URL = "https://zapture.app";
 const AUTH_ORIGIN = "https://auth.w3dev.app";
 const partition = "persist:zapture";
+const isMac = process.platform === "darwin";
+const RECORD_SHORTCUT = "CommandOrControl+Shift+5";
+const HUD_SIZE = { width: 320, height: 64 };
 let mainWindow: BrowserWindow | null = null;
 let editorWindow: BrowserWindow | null = null;
+let hudWindow: BrowserWindow | null = null;
+let hudState: RecordingHudState | null = null;
 let tray: Tray | null = null;
 let store: RecordingStore;
 let updater: DesktopUpdater;
@@ -64,9 +72,40 @@ const optionsSchema = z.object({
   cameraCorner: z.enum(["top-left", "top-right", "bottom-left", "bottom-right"]),
 });
 
+const hudStateSchema = z.object({
+  status: z.enum(["countdown", "recording", "paused"]),
+  countdown: z.number().int().min(0).max(10).optional(),
+  elapsedMs: z.number().min(0),
+  updatedAt: z.number(),
+}).nullable();
+
+// Must match --window in styles.css so resizing never flashes a mismatched colour.
+function windowBackground() {
+  return nativeTheme.shouldUseDarkColors ? "#1c1c1e" : "#f5f5f7";
+}
+
+function loadRenderer(win: BrowserWindow, hash?: string) {
+  if (process.env.ELECTRON_RENDERER_URL) void win.loadURL(`${process.env.ELECTRON_RENDERER_URL}${hash ? `#${hash}` : ""}`);
+  else void win.loadFile(join(__dirname, "../renderer/index.html"), hash ? { hash } : undefined);
+}
+
+/** Local renderer windows may only show the bundled UI; links open in the browser. */
+function guardRendererWindow(win: BrowserWindow) {
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isTrustedNavigation(url, { origins: [API_BASE_URL] })) void shell.openExternal(url);
+    return { action: "deny" };
+  });
+  const rendererOrigin = process.env.ELECTRON_RENDERER_URL ? new URL(process.env.ELECTRON_RENDERER_URL).origin : undefined;
+  win.webContents.on("will-navigate", (event, url) => {
+    if (!isTrustedNavigation(url, { origins: rendererOrigin ? [rendererOrigin] : [], allowFile: true })) event.preventDefault();
+  });
+  // Pinch and Cmd+/- zoom make the UI read as a web page; keep it at 100%.
+  win.webContents.on("did-finish-load", () => void win.webContents.setVisualZoomLevelLimits(1, 1));
+}
+
 function getWindowBounds(mode: typeof windowMode) {
   return mode === "recorder"
-    ? { width: 1180, height: 780, minWidth: 920, minHeight: 640, resizable: true }
+    ? { width: 1080, height: 720, minWidth: 880, minHeight: 600, resizable: true }
     : { width: 400, height: 340, minWidth: 400, minHeight: 340, resizable: false };
 }
 
@@ -89,8 +128,10 @@ function createMainWindow() {
     minWidth: bounds.minWidth,
     minHeight: bounds.minHeight,
     resizable: bounds.resizable,
-    backgroundColor: "#10100f",
-    titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
+    backgroundColor: windowBackground(),
+    titleBarStyle: isMac ? "hiddenInset" : "default",
+    // Vertically centre the traffic lights in the 52px toolbar.
+    trafficLightPosition: isMac ? { x: 18, y: 18 } : undefined,
     webPreferences: {
       preload: join(__dirname, "../preload/index.cjs"),
       partition,
@@ -98,19 +139,13 @@ function createMainWindow() {
       nodeIntegration: false,
       sandbox: true,
       webSecurity: true,
+      // The recorder composites and encodes in this renderer; it must keep
+      // running while the window is hidden behind the recording HUD.
+      backgroundThrottling: false,
     },
   });
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    if (isTrustedNavigation(url, { origins: [API_BASE_URL] })) void shell.openExternal(url);
-    return { action: "deny" };
-  });
-  const rendererOrigin = process.env.ELECTRON_RENDERER_URL ? new URL(process.env.ELECTRON_RENDERER_URL).origin : undefined;
-  win.webContents.on("will-navigate", (event, url) => {
-    if (!isTrustedNavigation(url, { origins: rendererOrigin ? [rendererOrigin] : [], allowFile: true })) event.preventDefault();
-  });
-
-  if (process.env.ELECTRON_RENDERER_URL) void win.loadURL(process.env.ELECTRON_RENDERER_URL);
-  else void win.loadFile(join(__dirname, "../renderer/index.html"));
+  guardRendererWindow(win);
+  loadRenderer(win);
   win.on("close", (event) => {
     if (process.platform === "darwin" && !isQuitting) {
       event.preventDefault();
@@ -130,6 +165,122 @@ function showMainWindow() {
   win.show();
   win.focus();
   return win;
+}
+
+function sendMenuCommand(command: MenuCommand) {
+  const win = showMainWindow();
+  const notify = () => win.webContents.send("desktop:menu-command", command);
+  if (win.webContents.isLoading()) win.webContents.once("did-finish-load", notify);
+  else notify();
+}
+
+function createHudWindow() {
+  const { workArea } = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+  const win = new BrowserWindow({
+    ...HUD_SIZE,
+    x: Math.round(workArea.x + (workArea.width - HUD_SIZE.width) / 2),
+    y: Math.round(workArea.y + workArea.height - HUD_SIZE.height - 28),
+    frame: false,
+    transparent: true,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    hasShadow: false,
+    show: false,
+    // Controls must work on the first click while another app is focused.
+    acceptFirstMouse: true,
+    webPreferences: {
+      preload: join(__dirname, "../preload/index.cjs"),
+      partition,
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+    },
+  });
+  win.setAlwaysOnTop(true, "screen-saver");
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  // Keep the recording controls out of the recording itself.
+  win.setContentProtection(true);
+  guardRendererWindow(win);
+  win.webContents.on("did-finish-load", () => win.webContents.send("desktop:recording-hud", hudState));
+  win.once("ready-to-show", () => win.showInactive());
+  win.on("closed", () => {
+    if (hudWindow === win) hudWindow = null;
+  });
+  loadRenderer(win, "hud");
+  hudWindow = win;
+  return win;
+}
+
+function applyRecordingHud(next: RecordingHudState | null) {
+  const wasActive = hudState !== null;
+  hudState = next;
+  if (!next) {
+    if (hudWindow && !hudWindow.isDestroyed()) hudWindow.close();
+    hudWindow = null;
+    if (wasActive) showMainWindow();
+    return;
+  }
+  const hud = hudWindow && !hudWindow.isDestroyed() ? hudWindow : createHudWindow();
+  if (!hud.webContents.isLoading()) hud.webContents.send("desktop:recording-hud", next);
+  // Get the recorder out of the way once capture starts; the HUD and tray bring it back.
+  if (next.status !== "countdown" && mainWindow?.isVisible()) mainWindow.hide();
+}
+
+function buildApplicationMenu() {
+  const recording: MenuItemConstructorOptions[] = [
+    { label: "New Recording…", accelerator: "CommandOrControl+N", click: prepareRecording },
+    { label: "Stop Recording", accelerator: "CommandOrControl+.", click: () => sendMenuCommand("stop-recording") },
+    { type: "separator" },
+    { label: "Recordings Library", accelerator: "CommandOrControl+L", click: () => sendMenuCommand("show-library") },
+  ];
+  const checkForUpdates: MenuItemConstructorOptions = {
+    label: "Check for Updates…",
+    click: async () => {
+      const result = await updater.check().catch((error: Error) => ({ status: "error", message: error.message }));
+      await dialog.showMessageBox({ type: "info", message: "Zapture Updates", detail: result.message });
+    },
+  };
+  const template: MenuItemConstructorOptions[] = [
+    ...(isMac
+      ? [{
+          label: app.name,
+          submenu: [
+            { role: "about" },
+            checkForUpdates,
+            { type: "separator" },
+            { role: "services" },
+            { type: "separator" },
+            { role: "hide" },
+            { role: "hideOthers" },
+            { role: "unhide" },
+            { type: "separator" },
+            { role: "quit" },
+          ],
+        } satisfies MenuItemConstructorOptions]
+      : []),
+    { label: "File", submenu: [...recording, { type: "separator" }, isMac ? { role: "close" } : { role: "quit" }] },
+    { role: "editMenu" },
+    {
+      label: "View",
+      submenu: [
+        ...(app.isPackaged ? [] : [{ role: "reload" }, { role: "toggleDevTools" }, { type: "separator" }] satisfies MenuItemConstructorOptions[]),
+        { role: "togglefullscreen" },
+      ],
+    },
+    { role: "windowMenu" },
+    {
+      role: "help",
+      submenu: [
+        ...(isMac ? [] : [checkForUpdates]),
+        { label: "Zapture Website", click: () => void shell.openExternal(API_BASE_URL) },
+      ],
+    },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
 function prepareRecording() {
@@ -407,6 +558,14 @@ function registerIpc() {
   });
   ipcMain.handle("desktop:open-editor", (_event, id) => createEditorWindow(z.string().uuid().parse(id)));
   ipcMain.handle("desktop:check-updates", () => updater.check());
+  ipcMain.handle("desktop:set-recording-hud", (event, state) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error("Only the recorder window can control the HUD");
+    applyRecordingHud(hudStateSchema.parse(state));
+  });
+  ipcMain.handle("desktop:recording-command", (event, command) => {
+    if (event.sender !== hudWindow?.webContents) throw new Error("Only the HUD can send recording commands");
+    mainWindow?.webContents.send("desktop:recording-command", z.enum(["pause", "resume", "stop", "cancel"]).parse(command));
+  });
 }
 
 function configureTray() {
@@ -418,7 +577,7 @@ function configureTray() {
   tray = new Tray(image);
   tray.setToolTip("Zapture");
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: "Start Recording…", accelerator: "CommandOrControl+Shift+5", click: prepareRecording },
+    { label: "Start Recording…", accelerator: RECORD_SHORTCUT, click: prepareRecording },
     { label: "Open Zapture", click: showMainWindow },
     { type: "separator" },
     { label: "Quit", click: () => app.quit() },
@@ -458,9 +617,15 @@ function startApplication() {
       queuedAuthUrl = null;
       await handleDesktopAuthCallback(authUrl);
     }
+    buildApplicationMenu();
+    nativeTheme.on("updated", () => {
+      for (const win of [mainWindow, editorWindow]) if (win && !win.isDestroyed()) win.setBackgroundColor(windowBackground());
+    });
     const win = mainWindow ?? createMainWindow();
     configureTray();
-    globalShortcut.register("CommandOrControl+Shift+5", prepareRecording);
+    if (!globalShortcut.register(RECORD_SHORTCUT, prepareRecording)) {
+      console.warn(`Could not register ${RECORD_SHORTCUT}; another app or the OS already uses it.`);
+    }
     updater.start();
 
     if (process.argv.includes("--ci-smoke")) {
