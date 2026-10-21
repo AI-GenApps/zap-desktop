@@ -1,0 +1,87 @@
+name: Build Zapture Desktop Preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to build from the current main branch
+        required: true
+        default: macos
+        type: choice
+        options:
+          - macos
+          - windows
+          - both
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    if: (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'desktop')) || (github.event_name == 'workflow_dispatch' && (inputs.platform == 'macos' || inputs.platform == 'both'))
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Test and typecheck
+        run: bun run test && bun run typecheck
+      - name: Generate macOS icon
+        run: ./scripts/generate-macos-icon.sh
+      - name: Package unsigned universal preview
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          DESKTOP_BUILD_VERSION: ${{ github.event_name == 'pull_request' && format('0.0.0-pr.{0}.{1}', github.event.pull_request.number, github.run_attempt) || format('0.0.0-main.{0}.{1}', github.run_number, github.run_attempt) }}
+          DESKTOP_PREVIEW: 'true'
+        run: bun run package:mac
+      - name: Smoke test packaged app
+        run: ./release/mac-universal/Zapture.app/Contents/MacOS/Zapture --ci-smoke
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zapture-desktop-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('main-{0}', github.run_number) }}-macos
+          path: |
+            release/*.dmg
+            release/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    if: (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'desktop')) || (github.event_name == 'workflow_dispatch' && (inputs.platform == 'windows' || inputs.platform == 'both'))
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Test and typecheck
+        run: bun run test && bun run typecheck
+      - name: Package unsigned x64 preview
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          DESKTOP_BUILD_VERSION: ${{ github.event_name == 'pull_request' && format('0.0.0-pr.{0}.{1}', github.event.pull_request.number, github.run_attempt) || format('0.0.0-main.{0}.{1}', github.run_number, github.run_attempt) }}
+          DESKTOP_PREVIEW: 'true'
+        run: bun run package:win
+      - name: Smoke test packaged app
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath ".\release\win-unpacked\Zapture.exe" -ArgumentList "--ci-smoke" -PassThru -Wait
+          if ($process.ExitCode -ne 0) { throw "Packaged Zapture exited with code $($process.ExitCode)" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zapture-desktop-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('main-{0}', github.run_number) }}-windows
+          path: release/*.exe
+          if-no-files-found: error
+          retention-days: 14
