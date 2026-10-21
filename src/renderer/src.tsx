@@ -16,6 +16,8 @@ import {
   type RecordingOptions,
 } from "@zapture/recorder-core";
 import type { AuthMode, AuthState, CaptureSource, MediaDeviceOption, RecordingCommand, UploadProgress } from "../shared/contracts";
+import { CameraBubble } from "./camera-bubble";
+import { CameraPreviewBox, PlacementOverlay, useCameraPreview } from "./camera-preview";
 import { requestDisplayStream } from "./display-capture.util";
 import { formatBytes, formatDuration } from "./format.util";
 import { RecordingHud } from "./hud";
@@ -60,10 +62,31 @@ function cameraAspectOf(stream: MediaStream | null) {
   return settings?.width && settings.height ? settings.width / settings.height : CAMERA_ASPECT_FALLBACK;
 }
 
-function SourceCard({ source, selected, onSelect }: { source: CaptureSource; selected: boolean; onSelect: () => void }) {
+interface PlacementBubble {
+  stream: MediaStream | null;
+  size: Exclude<CameraSize, "off">;
+  corner: CameraCorner;
+  shape: CameraShape;
+}
+
+function SourceCard({ source, selected, placement, onSelect }: { source: CaptureSource; selected: boolean; placement?: PlacementBubble; onSelect: () => void }) {
+  const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null);
+  const measureImage = (image: HTMLImageElement) => {
+    const { naturalWidth: width, naturalHeight: height } = image;
+    if (width && height) setImageSize((current) => (current?.width === width && current.height === height ? current : { width, height }));
+  };
   return (
     <button className="source-card" aria-pressed={selected} onClick={onSelect} type="button" title={source.name}>
-      <span className="source-thumb"><img src={source.thumbnail} alt="" draggable={false} /></span>
+      <span className="source-thumb">
+        <img
+          src={source.thumbnail}
+          alt=""
+          draggable={false}
+          ref={(image) => { if (image?.complete) measureImage(image); }}
+          onLoad={(event) => measureImage(event.currentTarget)}
+        />
+        {selected && placement ? <PlacementOverlay image={imageSize} {...placement} /> : null}
+      </span>
       <span className="source-name">{source.name}</span>
     </button>
   );
@@ -125,10 +148,12 @@ function App() {
   const [cameraCorner, setCameraCorner] = useState<CameraCorner>("bottom-left");
   const [cameraShape, setCameraShape] = useState<CameraShape>("circle");
   const [burnCamera, setBurnCamera] = useState(false);
+  const [showCameraBubble, setShowCameraBubble] = useState(true);
   const [includeSystemAudio, setIncludeSystemAudio] = useState(true);
   const [recordings, setRecordings] = useState<RecordingManifest[]>([]);
   const [activeRecording, setActiveRecording] = useState<RecordingManifest>();
   const [countdown, setCountdown] = useState<number | null>(null);
+  const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [auth, setAuth] = useState<AuthState>({ authenticated: false, canUpload: false });
@@ -225,6 +250,8 @@ function App() {
   }, [refreshDevices, refreshRecordings, refreshSources, view]);
 
   const isLive = activeRecording?.status === "recording" || activeRecording?.status === "paused";
+  const previewEnabled = view === "recorder" && tab === "record" && cameraSize !== "off" && !isLive && !starting && countdown === null && !stopping;
+  const cameraPreview = useCameraPreview(previewEnabled, cameraDeviceId);
 
   useEffect(() => {
     if (!activeRecording || !isLive) return;
@@ -246,6 +273,15 @@ function App() {
       });
     } else void window.zapture.setRecordingHud(null);
   }, [activeRecording, countdown, isLive, stopping]);
+
+  // The floating camera bubble runs from the countdown through the end of the recording.
+  const bubbleActive = showCameraBubble && !stopping && (countdown !== null || isLive);
+  useEffect(() => {
+    const state = bubbleActive && cameraSize !== "off"
+      ? { deviceId: cameraDeviceId || undefined, shape: burnCamera ? "circle" as const : cameraShape, size: cameraSize, corner: cameraCorner }
+      : null;
+    void window.zapture.setCameraBubble(state).catch(() => undefined);
+  }, [bubbleActive, burnCamera, cameraCorner, cameraDeviceId, cameraShape, cameraSize]);
 
   const deviceSummary = useMemo(() => {
     const microphone = microphones.find((device) => device.deviceId === microphoneDeviceId)?.label || "Default microphone";
@@ -452,6 +488,7 @@ function App() {
   const startRecording = async () => {
     if (!selectedSource || busy || activeRecordingRef.current) return;
     setBusy(true);
+    setStarting(true);
     setStatus("Opening capture devices…");
     try {
       const prepared = await prepareCapture(selectedSource);
@@ -531,6 +568,7 @@ function App() {
       cleanupCapture();
       setStatus(error instanceof Error ? error.message : "Could not start recording.");
     } finally {
+      setStarting(false);
       setBusy(false);
     }
   };
@@ -639,6 +677,10 @@ function App() {
 
   const visibleSources = sources.filter((source) => source.kind === sourceKind);
   const recording = isLive || countdown !== null || stopping;
+  const effectiveShape: CameraShape = burnCamera ? "circle" : cameraShape;
+  const placement: PlacementBubble | undefined = cameraSize === "off"
+    ? undefined
+    : { stream: cameraPreview.stream, size: cameraSize, corner: cameraCorner, shape: effectiveShape };
 
   return (
     <div className="app-window">
@@ -672,7 +714,7 @@ function App() {
             </div>
             <div className="source-grid" data-kind={sourceKind}>
               {visibleSources.map((source) => (
-                <SourceCard key={source.id} source={source} selected={source.id === selectedSource?.id} onSelect={() => !recording && setSelectedSource(source)} />
+                <SourceCard key={source.id} source={source} selected={source.id === selectedSource?.id} placement={placement} onSelect={() => !recording && setSelectedSource(source)} />
               ))}
               {!visibleSources.length ? <p className="empty">{sourceKind === "screen" ? "No screens found." : "No windows found."}</p> : null}
             </div>
@@ -715,6 +757,7 @@ function App() {
                   {cameras.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}
                 </select>
               </label>
+              {cameraSize !== "off" && !recording ? <CameraPreviewBox preview={cameraPreview} shape={effectiveShape} /> : null}
               <div className="field">
                 <span id="camera-size-label">Size</span>
                 <div className="segmented segmented-fill" role="radiogroup" aria-labelledby="camera-size-label">
@@ -750,6 +793,10 @@ function App() {
               <label className="switch-row">
                 <span>Burn camera into video</span>
                 <input type="checkbox" role="switch" checked={burnCamera} disabled={cameraSize === "off"} onChange={(event) => setBurnCamera(event.target.checked)} />
+              </label>
+              <label className="switch-row">
+                <span>Show camera while recording</span>
+                <input type="checkbox" role="switch" checked={showCameraBubble} disabled={cameraSize === "off"} onChange={(event) => setShowCameraBubble(event.target.checked)} />
               </label>
             </fieldset>
 
@@ -827,7 +874,7 @@ function FilmIcon() {
   return <svg className="icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3.5" width="9" height="9" rx="2" fill="none" stroke="currentColor" strokeWidth="1.3" /><path d="m11 7 3-1.8v5.6L11 9" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" /></svg>;
 }
 
-const isHud = window.location.hash === "#hud";
+const surface = window.location.hash === "#hud" ? "hud" : window.location.hash === "#camera-bubble" ? "camera-bubble" : "app";
 document.documentElement.dataset.platform = window.zapture.platform;
-document.documentElement.dataset.surface = isHud ? "hud" : "app";
-createRoot(document.getElementById("root")!).render(<StrictMode>{isHud ? <RecordingHud /> : <App />}</StrictMode>);
+document.documentElement.dataset.surface = surface;
+createRoot(document.getElementById("root")!).render(<StrictMode>{surface === "hud" ? <RecordingHud /> : surface === "camera-bubble" ? <CameraBubble /> : <App />}</StrictMode>);

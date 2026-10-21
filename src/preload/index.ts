@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { DesktopApi, MenuCommand, RecordingCommand, RecordingHudState, UploadProgress } from "../shared/contracts";
+import type { CameraBubbleState, DesktopApi, MenuCommand, RecordingCommand, RecordingHudState, UploadProgress } from "../shared/contracts";
 
 const api: DesktopApi = {
   platform: process.platform,
@@ -36,6 +36,13 @@ const api: DesktopApi = {
   },
   setRecordingHud: (state) => ipcRenderer.invoke("desktop:set-recording-hud", state),
   sendRecordingCommand: (command) => ipcRenderer.invoke("desktop:recording-command", command),
+  setCameraBubble: (state) => ipcRenderer.invoke("desktop:set-camera-bubble", state),
+  reportCameraBubbleFailure: (reason) => ipcRenderer.invoke("desktop:camera-bubble-failed", reason),
+  onCameraBubble: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, state: CameraBubbleState | null) => listener(state);
+    ipcRenderer.on("desktop:camera-bubble", handler);
+    return () => ipcRenderer.removeListener("desktop:camera-bubble", handler);
+  },
   onRecordingHud: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, state: RecordingHudState | null) => listener(state);
     ipcRenderer.on("desktop:recording-hud", handler);

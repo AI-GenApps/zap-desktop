@@ -19,7 +19,7 @@ import {
   Tray,
   type MenuItemConstructorOptions,
 } from "electron";
-import type { AuthMode, AuthState, MenuCommand, RecordingHudState } from "../shared/contracts";
+import type { AuthMode, AuthState, CameraBubbleState, MenuCommand, RecordingHudState } from "../shared/contracts";
 import {
   AUTH_ATTEMPT_TTL_MS,
   buildDesktopAuthRedirectUrl,
@@ -31,6 +31,7 @@ import {
   unauthenticatedAuthState,
   type PendingAuthAttempt,
 } from "./desktop-auth.util";
+import { bubbleSize, HUD_SIZE, hudBounds, placeBubble } from "./camera-bubble.util";
 import { canGrantMediaPermission, trustedLocalOrigin } from "./media-permission.util";
 import { isTrustedNavigation } from "./navigation.util";
 import { RecordingStore } from "./recording-store";
@@ -51,11 +52,14 @@ if (!app.isPackaged) {
 
 const isMac = process.platform === "darwin";
 const RECORD_SHORTCUT = "CommandOrControl+Shift+5";
-const HUD_SIZE = { width: 320, height: 64 };
 let mainWindow: BrowserWindow | null = null;
 let editorWindow: BrowserWindow | null = null;
 let hudWindow: BrowserWindow | null = null;
 let hudState: RecordingHudState | null = null;
+let cameraBubbleWindow: BrowserWindow | null = null;
+let cameraBubbleState: CameraBubbleState | null = null;
+// Set when the bubble's camera failed; stays closed until the recorder hides it.
+let cameraBubbleFailed = false;
 let tray: Tray | null = null;
 let store: RecordingStore;
 let updater: DesktopUpdater;
@@ -88,6 +92,13 @@ const cameraTrackSchema = z.object({
   startOffsetMs: z.number().finite(),
   aspect: z.number().finite(),
 });
+
+const cameraBubbleSchema = z.object({
+  deviceId: z.string().max(512).optional(),
+  shape: z.enum(["circle", "rounded"]),
+  size: z.enum(["small", "medium", "large"]),
+  corner: z.enum(["top-left", "top-right", "bottom-left", "bottom-right"]),
+}).nullable();
 
 const hudStateSchema = z.object({
   status: z.enum(["countdown", "recording", "paused"]),
@@ -171,7 +182,13 @@ function createMainWindow() {
   });
   win.on("closed", () => {
     if (mainWindow === win) mainWindow = null;
+    applyCameraBubble(null);
   });
+  // A reloaded or crashed recorder renderer loses its recording, so it can no longer hide the bubble itself.
+  win.webContents.on("did-start-navigation", (details) => {
+    if (details.isMainFrame && !details.isSameDocument) applyCameraBubble(null);
+  });
+  win.webContents.on("render-process-gone", () => applyCameraBubble(null));
   mainWindow = win;
   return win;
 }
@@ -194,9 +211,7 @@ function sendMenuCommand(command: MenuCommand) {
 function createHudWindow() {
   const { workArea } = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
   const win = new BrowserWindow({
-    ...HUD_SIZE,
-    x: Math.round(workArea.x + (workArea.width - HUD_SIZE.width) / 2),
-    y: Math.round(workArea.y + workArea.height - HUD_SIZE.height - 28),
+    ...hudBounds(workArea),
     frame: false,
     transparent: true,
     resizable: false,
@@ -245,6 +260,85 @@ function applyRecordingHud(next: RecordingHudState | null) {
   if (!hud.webContents.isLoading()) hud.webContents.send("desktop:recording-hud", next);
   // Get the recorder out of the way once capture starts; the HUD and tray bring it back.
   if (next.status !== "countdown" && mainWindow?.isVisible()) mainWindow.hide();
+}
+
+function createCameraBubbleWindow(state: CameraBubbleState) {
+  // Use the HUD's display when it is up so the two can never land on different screens.
+  const display = hudWindow && !hudWindow.isDestroyed()
+    ? screen.getDisplayMatching(hudWindow.getBounds())
+    : screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+  const { workArea } = display;
+  const win = new BrowserWindow({
+    ...placeBubble(workArea, state),
+    frame: false,
+    transparent: true,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    hasShadow: false,
+    show: false,
+    // Dragging must work on the first click while another app is focused.
+    acceptFirstMouse: true,
+    webPreferences: {
+      preload: join(__dirname, "../preload/index.cjs"),
+      partition,
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      // The bubble must keep its camera running while another app is frontmost.
+      backgroundThrottling: false,
+    },
+  });
+  win.setAlwaysOnTop(true, "screen-saver");
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  // Always excluded from capture: separate-track mode records the camera on its own and burn-in
+  // already composites it, so the window must never appear a second time in the screen recording.
+  win.setContentProtection(true);
+  guardRendererWindow(win);
+  win.webContents.on("did-finish-load", () => win.webContents.send("desktop:camera-bubble", cameraBubbleState));
+  win.once("ready-to-show", () => win.showInactive());
+  win.webContents.on("render-process-gone", () => {
+    console.warn("Camera bubble closed: its renderer exited");
+    cameraBubbleFailed = true;
+    if (cameraBubbleWindow === win) closeCameraBubble();
+  });
+  win.on("closed", () => {
+    if (cameraBubbleWindow === win) cameraBubbleWindow = null;
+  });
+  loadRenderer(win, "camera-bubble");
+  cameraBubbleWindow = win;
+  return win;
+}
+
+function closeCameraBubble() {
+  const win = cameraBubbleWindow;
+  cameraBubbleWindow = null;
+  if (win && !win.isDestroyed()) win.close();
+}
+
+function applyCameraBubble(next: CameraBubbleState | null) {
+  const previous = cameraBubbleState;
+  cameraBubbleState = next;
+  if (!next) {
+    cameraBubbleFailed = false;
+    closeCameraBubble();
+    return;
+  }
+  if (cameraBubbleFailed) return;
+  const existing = cameraBubbleWindow && !cameraBubbleWindow.isDestroyed() ? cameraBubbleWindow : null;
+  if (!existing) {
+    createCameraBubbleWindow(next);
+    return;
+  }
+  if (previous && (previous.size !== next.size || previous.shape !== next.shape)) {
+    // Resize in place so a dragged bubble stays where the user left it.
+    const { x, y } = existing.getBounds();
+    existing.setBounds({ x, y, ...bubbleSize(next) });
+  }
+  if (!existing.webContents.isLoading()) existing.webContents.send("desktop:camera-bubble", next);
 }
 
 function buildApplicationMenu() {
@@ -525,12 +619,17 @@ async function handleDesktopAuthCallback(rawUrl: string) {
 
 function configureSession() {
   const appSession = session.fromPartition(partition);
-  appSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin) =>
-    permission === "media" && trustedLocalOrigin(requestingOrigin),
+  appSession.setPermissionCheckHandler((webContents, permission, requestingOrigin) =>
+    permission === "media"
+    && trustedLocalOrigin(requestingOrigin)
+    && (webContents === mainWindow?.webContents || webContents === cameraBubbleWindow?.webContents),
   );
-  appSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    const isMainRenderer = webContents === mainWindow?.webContents;
-    callback(canGrantMediaPermission(permission, isMainRenderer, new URL(webContents.getURL()).origin));
+  appSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    const requester = webContents === mainWindow?.webContents
+      ? "main"
+      : webContents === cameraBubbleWindow?.webContents ? "camera-bubble" : "other";
+    const mediaTypes = "mediaTypes" in details ? details.mediaTypes ?? [] : [];
+    callback(canGrantMediaPermission(permission, requester, new URL(webContents.getURL()).origin, mediaTypes));
   });
   return appSession;
 }
@@ -595,6 +694,16 @@ function registerIpc() {
   ipcMain.handle("desktop:set-recording-hud", (event, state) => {
     if (event.sender !== mainWindow?.webContents) throw new Error("Only the recorder window can control the HUD");
     applyRecordingHud(hudStateSchema.parse(state));
+  });
+  ipcMain.handle("desktop:set-camera-bubble", (event, state) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error("Only the recorder window can control the camera bubble");
+    applyCameraBubble(cameraBubbleSchema.parse(state));
+  });
+  ipcMain.handle("desktop:camera-bubble-failed", (event, reason) => {
+    if (event.sender !== cameraBubbleWindow?.webContents) throw new Error("Only the camera bubble can report its failure");
+    console.warn("Camera bubble closed:", z.string().max(500).catch("unknown error").parse(reason));
+    cameraBubbleFailed = true;
+    closeCameraBubble();
   });
   ipcMain.handle("desktop:recording-command", (event, command) => {
     if (event.sender !== hudWindow?.webContents) throw new Error("Only the HUD can send recording commands");

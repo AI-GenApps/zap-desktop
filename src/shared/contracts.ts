@@ -1,4 +1,4 @@
-import type { RecordingManifest, RecordingOptions } from "@zapture/recorder-core";
+import type { CameraCorner, CameraShape, CameraSize, RecordingManifest, RecordingOptions } from "@zapture/recorder-core";
 
 export interface CameraTrackStart {
   mimeType: string;
@@ -45,6 +45,16 @@ export interface RecordingHudState {
   updatedAt: number;
 }
 
+/** What the floating camera bubble shows; `null` hides it. */
+export interface CameraBubbleState {
+  /** Camera to open; the system default when omitted. */
+  deviceId?: string;
+  shape: CameraShape;
+  size: Exclude<CameraSize, "off">;
+  /** Corner of the display where the bubble first appears. */
+  corner: CameraCorner;
+}
+
 export type RecordingCommand = "pause" | "resume" | "stop" | "cancel";
 
 /** Application menu actions forwarded to the recorder window. */
@@ -76,6 +86,11 @@ export interface DesktopApi {
   setRecordingHud: (state: RecordingHudState | null) => Promise<void>;
   /** HUD window: ask the recorder window to pause, resume, stop, or cancel. */
   sendRecordingCommand: (command: RecordingCommand) => Promise<void>;
+  /** Recorder window: show, update, or hide (`null`) the floating camera bubble. */
+  setCameraBubble: (state: CameraBubbleState | null) => Promise<void>;
+  /** Camera bubble window: its camera failed, so close it quietly. */
+  reportCameraBubbleFailure: (reason: string) => Promise<void>;
+  onCameraBubble: (listener: (state: CameraBubbleState | null) => void) => () => void;
   onRecordingHud: (listener: (state: RecordingHudState | null) => void) => () => void;
   onRecordingCommand: (listener: (command: RecordingCommand) => void) => () => void;
   onMenuCommand: (listener: (command: MenuCommand) => void) => () => void;
