@@ -625,7 +625,20 @@ if (process.defaultApp && process.argv.length >= 2) {
   app.setAsDefaultProtocolClient("zapture");
 }
 
-const hasSingleInstanceLock = app.requestSingleInstanceLock();
+/**
+ * electron-vite's watch mode starts the rebuilt app before the previous process
+ * has exited, so in development wait briefly for the old instance to release
+ * the lock instead of quitting (which would also stop the dev server).
+ */
+async function acquireSingleInstanceLock() {
+  if (app.requestSingleInstanceLock()) return true;
+  if (app.isPackaged) return false;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+    if (app.requestSingleInstanceLock()) return true;
+  }
+  return false;
+}
 
 function startApplication() {
   app.on("second-instance", (_event, commandLine) => {
@@ -691,5 +704,7 @@ function startApplication() {
   });
 }
 
-if (hasSingleInstanceLock) startApplication();
-else app.quit();
+void acquireSingleInstanceLock().then((acquired) => {
+  if (acquired) startApplication();
+  else app.quit();
+});
